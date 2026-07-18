@@ -378,18 +378,15 @@ func (st *store) pruneLocked() error {
 	if err := st.pruneOldEntries(time.Now()); err != nil {
 		return err
 	}
-	if err := st.removeOrphanRetainedFiles(); err != nil {
-		return err
-	}
 	if st.maxSize <= 0 {
-		return st.removeOrphanBlobs()
+		return st.removeOrphanOutputFiles(true)
 	}
 	total, err := st.compressedSize()
 	if err != nil {
 		return err
 	}
 	if total <= st.maxSize {
-		return st.removeOrphanBlobs()
+		return st.removeOrphanOutputFiles(true)
 	}
 
 	candidates, err := st.pruneCandidates()
@@ -413,7 +410,8 @@ func (st *store) pruneLocked() error {
 	if st.verbose && removed > 0 {
 		log.Printf("gocachez: pruned %d blobs, compressed size now %s", removed, formatSize(total))
 	}
-	return st.removeOrphanBlobs()
+
+	return st.removeOrphanOutputFiles(true)
 }
 
 type pruneCandidate struct {
@@ -435,38 +433,6 @@ func (st *store) pruneCandidates() ([]pruneCandidate, error) {
 		return nil, fmt.Errorf("query prune candidates: %w", err)
 	}
 	return candidates, nil
-}
-
-func (st *store) removeOrphanBlobs() error {
-	err := filepath.WalkDir(st.blobsDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() || !strings.HasSuffix(path, ".zst") {
-			return nil
-		}
-		outputID := strings.TrimSuffix(filepath.Base(path), ".zst")
-		entryRefs, err := st.q.countEntriesByOutputID(context.Background(), outputID)
-		if err != nil {
-			return fmt.Errorf("query entry blob references: %w", err)
-		}
-		if entryRefs == 0 {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("remove orphan blob: %w", err)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	return removeEmptyDirs(st.blobsDir)
-}
-
-func (st *store) removeOrphanRetainedFiles() error {
-	return st.removeOrphanOutputFiles(retainedRoot(st.versionDir), func(path string) bool {
-		return strings.HasSuffix(path, ".a") || strings.HasSuffix(path, ".go")
-	})
 }
 
 func (st *store) pruneOldEntries(now time.Time) error {
@@ -619,41 +585,69 @@ func markRetainedFileUsed(path string) error {
 	return os.Chtimes(path, now, now)
 }
 
-func (st *store) removeOrphanOutputFiles(root string, include func(string) bool) error {
-	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("stat retained root: %w", err)
+func (st *store) removeOrphanOutputFiles(includeBlobs bool) error {
+	// Output files are already partitioned by the first byte of their hex ID.
+	// Reconcile one shard at a time to keep memory bounded without per-file SQL.
+	referenced := make(map[string]struct{})
+	for shard := range 256 {
+		lower := fmt.Sprintf("%02x", shard)
+		upper := fmt.Sprintf("%02x", shard+1)
+		if shard == 255 {
+			upper = "g"
+		}
+		if err := st.q.referencedOutputIDs(context.Background(), lower, upper, referenced); err != nil {
+			return fmt.Errorf("query referenced outputs in shard %s: %w", lower, err)
+		}
+		if includeBlobs {
+			if err := removeOrphanFilesInDir(filepath.Join(st.blobsDir, lower), referenced, ".zst"); err != nil {
+				return fmt.Errorf("remove orphan blobs in shard %s: %w", lower, err)
+			}
+		}
+		if err := removeOrphanFilesInDir(filepath.Join(retainedRoot(st.versionDir), lower), referenced, ".a", ".go"); err != nil {
+			return fmt.Errorf("remove orphan retained files in shard %s: %w", lower, err)
+		}
 	}
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
+	if includeBlobs {
+		if err := removeEmptyDirs(st.blobsDir); err != nil {
 			return err
 		}
-		if d.IsDir() || !include(path) {
+	}
+	return removeEmptyDirs(retainedRoot(st.versionDir))
+}
+
+func removeOrphanFilesInDir(root string, referenced map[string]struct{}, extensions ...string) error {
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
 			return nil
 		}
-		outputID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-		entryRefs, err := st.q.countEntriesByOutputID(context.Background(), outputID)
-		if err != nil {
-			return fmt.Errorf("query retained references: %w", err)
+		ext := filepath.Ext(path)
+		if !slices.Contains(extensions, ext) {
+			return nil
 		}
-		if entryRefs == 0 {
+		outputID := strings.TrimSuffix(filepath.Base(path), ext)
+		if _, ok := referenced[outputID]; !ok {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("remove orphan retained file: %w", err)
+				return err
 			}
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return removeEmptyDirs(root)
+	return err
 }
 
 func removeEmptyDirs(root string) error {
 	var dirs []string
 	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		if d.IsDir() && path != root {

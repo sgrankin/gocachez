@@ -271,6 +271,27 @@ func (c *catalog) listOutputs(ctx context.Context, includeBlobType bool, classif
 	return outputs, nil
 }
 
+func (c *catalog) referencedOutputIDs(ctx context.Context, lower, upper string, outputIDs map[string]struct{}) error {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT DISTINCT output_id
+FROM entries
+WHERE output_id >= ? AND output_id < ?`, lower, upper)
+	if err != nil {
+		return err
+	}
+	defer rows.Close() //nolint:errcheck
+
+	clear(outputIDs)
+	for rows.Next() {
+		var outputID string
+		if err := rows.Scan(&outputID); err != nil {
+			return err
+		}
+		outputIDs[outputID] = struct{}{}
+	}
+	return rows.Err()
+}
+
 func (c *catalog) updateBlobType(ctx context.Context, outputID string, kind blobTypeKind, classifierVersion int64) error {
 	_, err := c.db.ExecContext(ctx, `
 UPDATE entries
@@ -321,13 +342,4 @@ ORDER BY MAX(e.accessed_at)`)
 		return nil, err
 	}
 	return candidates, nil
-}
-
-func (c *catalog) countEntriesByOutputID(ctx context.Context, outputID string) (int64, error) {
-	var count int64
-	err := c.db.QueryRowContext(ctx, `
-SELECT COUNT(*)
-FROM entries
-WHERE output_id = ?`, outputID).Scan(&count)
-	return count, err
 }

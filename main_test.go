@@ -1149,6 +1149,9 @@ func TestCatalogQueriesRespectCanceledContext(t *testing.T) {
 	if _, err := st.q.pruneCandidates(ctx); err == nil {
 		t.Fatal("pruneCandidates succeeded with canceled context")
 	}
+	if err := st.q.referencedOutputIDs(ctx, "00", "01", make(map[string]struct{})); err == nil {
+		t.Fatal("referencedOutputIDs succeeded with canceled context")
+	}
 }
 
 func TestPruneUsesBlobLRU(t *testing.T) {

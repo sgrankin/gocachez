@@ -53,7 +53,7 @@ func (st *store) cleanLocked() error {
 	}
 	activeRuns := int64(0)
 	if st.q != nil {
-		if err := st.removeOrphanRetainedFiles(); err != nil {
+		if err := st.removeOrphanOutputFiles(false); err != nil {
 			_ = st.db.Close()
 			return err
 		}
