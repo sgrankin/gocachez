@@ -818,7 +818,7 @@ func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
 
 	exportPath := retainedPath(cacheDir, outputID, ".a")
 	old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
-	for _, path := range []string{exportPath, res.DiskPath} {
+	for _, path := range []string{exportPath, filepath.Join(filepath.Dir(res.DiskPath), "run.lock")} {
 		if err := os.Chtimes(path, old, old); err != nil {
 			t.Fatal(err)
 		}
@@ -843,6 +843,64 @@ func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
 	}
 	if _, err := os.Stat(res.DiskPath); !os.IsNotExist(err) {
 		t.Fatalf("old retained live file stat err = %v, want not exist", err)
+	}
+}
+
+func TestRefreshingRetainedFileDoesNotKeepOldLiveRun(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	exportData := []byte("uFAKE")
+	body := goArchive(goPkgdef(exportData), bytes.Repeat([]byte("object data"), 1024))
+	outputID := bytes.Repeat([]byte{65}, 32)
+
+	st, err := newStore(config{
+		dir:    cacheDir,
+		maxAge: defaultMaxAge,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{66}, 32),
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
+	if err := os.Chtimes(filepath.Join(filepath.Dir(first.DiskPath), "run.lock"), old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = newStore(config{
+		dir:    cacheDir,
+		maxAge: defaultMaxAge,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.put(request{
+		ID:       2,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{67}, 32),
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	if _, err := os.Stat(first.DiskPath); !os.IsNotExist(err) {
+		t.Fatalf("old retained live file stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(retainedPath(cacheDir, outputID, ".a")); err != nil {
+		t.Fatalf("refreshed retained export was removed: %v", err)
 	}
 }
 

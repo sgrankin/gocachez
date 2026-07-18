@@ -309,6 +309,12 @@ func (st *store) unregisterRun() error {
 	if prepareErr != nil {
 		err = errors.Join(err, prepareErr)
 	}
+	if retainedLiveFiles && prepareErr == nil {
+		now := time.Now()
+		if touchErr := os.Chtimes(st.runLock.Path(), now, now); touchErr != nil {
+			err = errors.Join(err, fmt.Errorf("timestamp retained live run: %w", touchErr))
+		}
+	}
 	if unlockErr := st.runLock.Unlock(); unlockErr != nil {
 		err = errors.Join(err, fmt.Errorf("unlock live run: %w", unlockErr))
 	}

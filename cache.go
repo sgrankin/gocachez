@@ -544,29 +544,17 @@ func (st *store) pruneOldRetainedLiveDirs(now time.Time) error {
 }
 
 func retainedLiveRunExpired(runDir string, cutoff time.Time) (bool, error) {
-	entries, err := os.ReadDir(runDir)
+	info, err := os.Stat(filepath.Join(runDir, "run.lock"))
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("read retained live run: %w", err)
+		return false, fmt.Errorf("stat retained live run: %w", err)
 	}
-	for _, entry := range entries {
-		if entry.Name() == "run.lock" {
-			continue
-		}
-		if entry.IsDir() {
-			return false, nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return false, fmt.Errorf("stat retained live file: %w", err)
-		}
-		if !info.Mode().IsRegular() || !info.ModTime().Before(cutoff) {
-			return false, nil
-		}
-	}
-	return true, nil
+	// Retained files are hard-linked into live runs, so their mtimes cannot
+	// represent the age of a particular run. The lock file is unique to the run
+	// and timestamped when that run closes.
+	return info.ModTime().Before(cutoff), nil
 }
 
 func trimCutoff(maxAge time.Duration, now time.Time) time.Time {
