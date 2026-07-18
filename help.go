@@ -41,7 +41,7 @@ const rootHelp = `Usage:
   gocachez <command> [flags]
 
 Commands:
-  clean    Remove inactive cache state
+  clean    Remove cache data not currently in use
   status   Show cache state
 
 Flags:
@@ -56,8 +56,8 @@ Flags:
 const cleanHelp = `Usage:
   gocachez clean [flags]
 
-Remove inactive cache state. State currently used by active gocachez processes
-is preserved.
+Remove all cache data not currently in use. Data used by active gocachez
+processes is preserved; run clean again after those processes exit to remove it.
 
 Flags:
   -config path  JSON config file
