@@ -192,11 +192,6 @@ func retainEscapedGeneratedGoSource(path, retainedPath string) (retainedTypeKind
 	return kind, true, nil
 }
 
-func isEscapedGeneratedGoSource(data []byte) bool {
-	_, ok := retainedGeneratedSourceKind(data)
-	return ok
-}
-
 func retainedGeneratedSourceKind(data []byte) (retainedTypeKind, bool) {
 	if isGeneratedCgoSource(data) {
 		return retainedTypeGeneratedCgoSource, true

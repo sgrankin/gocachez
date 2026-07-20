@@ -317,11 +317,11 @@ WHERE output_id = ?`, int64(kind), classifierVersion, outputID)
 	return err
 }
 
-func (c *catalog) updateRetainedType(ctx context.Context, outputID string, kind retainedTypeKind, classifierVersion int64) error {
+func (c *catalog) updateRetainedType(ctx context.Context, outputID string, kind retainedTypeKind) error {
 	_, err := c.db.ExecContext(ctx, `
 UPDATE entries
 SET retained_type = ?, retained_type_version = ?
-WHERE output_id = ?`, int64(kind), classifierVersion, outputID)
+WHERE output_id = ?`, int64(kind), retainedClassifierVersion, outputID)
 	return err
 }
 

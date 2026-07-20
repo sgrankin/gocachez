@@ -501,7 +501,7 @@ func persistRetainedTypes(dbPath string, classified map[string]retainedTypeKind)
 	}
 	qtx := newCatalog(db).withTx(tx)
 	for outputID, kind := range classified {
-		if err := qtx.updateRetainedType(ctx, outputID, kind, retainedClassifierVersion); err != nil {
+		if err := qtx.updateRetainedType(ctx, outputID, kind); err != nil {
 			_ = tx.Rollback()
 			return err
 		}

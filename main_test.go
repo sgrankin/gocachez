@@ -2161,7 +2161,7 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 	}
 	st.close()
 
-	versionDir, _, _, _ := cachePaths(config{dir: cacheDir})
+	versionDir := cacheVersionDir(config{dir: cacheDir})
 	dbPath := filepath.Join(versionDir, "cache.db")
 	outputHex := hexOf(outputID)
 
@@ -2235,7 +2235,7 @@ func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
 	if err := st.q.updateBlobType(ctx, output1, blobTypeGoPackageArchive, blobClassifierVersion); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.q.updateRetainedType(ctx, output1, retainedTypeExportArchive, retainedClassifierVersion); err != nil {
+	if err := st.q.updateRetainedType(ctx, output1, retainedTypeExportArchive); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2260,7 +2260,7 @@ func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
 	if err := st.q.updateBlobType(ctx, output2, blobTypeGoSource, blobClassifierVersion); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.q.updateRetainedType(ctx, output2, retainedTypeGeneratedCgoSource, retainedClassifierVersion); err != nil {
+	if err := st.q.updateRetainedType(ctx, output2, retainedTypeGeneratedCgoSource); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.q.upsertEntry(ctx, changed); err != nil {

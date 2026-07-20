@@ -96,11 +96,15 @@ func newStore(cfg config) (*store, error) {
 }
 
 func cachePaths(cfg config) (string, string, string, string) {
-	versionDir := filepath.Join(cfg.dir, fmt.Sprintf("v%d", cacheSchemaVersion))
+	versionDir := cacheVersionDir(cfg)
 	return versionDir,
 		filepath.Join(versionDir, "blobs"),
 		filepath.Join(versionDir, "live"),
 		filepath.Join(versionDir, "lifecycle.lock")
+}
+
+func cacheVersionDir(cfg config) string {
+	return filepath.Join(cfg.dir, fmt.Sprintf("v%d", cacheSchemaVersion))
 }
 
 func retainedRoot(versionDir string) string {
@@ -418,7 +422,7 @@ func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
 		return false, err
 	}
 	if retained {
-		if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeExportArchive, retainedClassifierVersion); err != nil {
+		if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeExportArchive); err != nil {
 			if st.verbose {
 				log.Printf("gocachez: cache retained file type failed: %v", err)
 			}
@@ -429,7 +433,7 @@ func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
 	if err != nil || !retained {
 		return retained, err
 	}
-	if err := st.q.updateRetainedType(context.Background(), outputID, kind, retainedClassifierVersion); err != nil {
+	if err := st.q.updateRetainedType(context.Background(), outputID, kind); err != nil {
 		if st.verbose {
 			log.Printf("gocachez: cache retained file type failed: %v", err)
 		}
