@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +30,9 @@ CREATE TABLE IF NOT EXISTS entries (
 	created_at INTEGER NOT NULL,
 	accessed_at INTEGER NOT NULL,
 	blob_type INTEGER,
-	blob_type_version INTEGER
+	blob_type_version INTEGER,
+	retained_type INTEGER,
+	retained_type_version INTEGER
 );
 CREATE INDEX IF NOT EXISTS entries_accessed_at ON entries(accessed_at);
 
@@ -251,6 +254,8 @@ func migrateSchema(ctx context.Context, db catalogDB) error {
 	for _, col := range []struct{ name, ddl string }{
 		{"blob_type", "blob_type INTEGER"},
 		{"blob_type_version", "blob_type_version INTEGER"},
+		{"retained_type", "retained_type INTEGER"},
+		{"retained_type_version", "retained_type_version INTEGER"},
 	} {
 		has, err := entriesHasColumn(ctx, db, col.name)
 		if err != nil {
@@ -262,16 +267,54 @@ func migrateSchema(ctx context.Context, db catalogDB) error {
 			}
 		}
 	}
-	// Covering index for the status GROUP BY output_id scan (sizes + cached blob
-	// type). Created here rather than in catalogSchema because it references the
-	// blob-type columns added above; it supersedes a plain output_id index.
-	if _, err := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS entries_output_cover ON entries(output_id, size, compressed_size, blob_type, blob_type_version)`); err != nil {
-		return fmt.Errorf("create entries_output_cover index: %w", err)
+	// Keep the status GROUP BY output_id scan covering as cached classifications
+	// are added to the schema.
+	current, err := statusCoverIndexCurrent(ctx, db)
+	if err != nil {
+		return fmt.Errorf("inspect entries_output_cover index: %w", err)
+	}
+	if !current {
+		if _, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS entries_output_cover`); err != nil {
+			return fmt.Errorf("drop stale entries_output_cover index: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, `CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, blob_type, blob_type_version, retained_type, retained_type_version)`); err != nil {
+			return fmt.Errorf("create entries_output_cover index: %w", err)
+		}
 	}
 	if _, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS entries_output_id`); err != nil {
 		return fmt.Errorf("drop entries_output_id index: %w", err)
 	}
 	return nil
+}
+
+func statusCoverIndexCurrent(ctx context.Context, db catalogDB) (bool, error) {
+	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_index_info('entries_output_cover') ORDER BY seqno`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close() //nolint:errcheck
+
+	want := []string{
+		"output_id",
+		"size",
+		"compressed_size",
+		"blob_type",
+		"blob_type_version",
+		"retained_type",
+		"retained_type_version",
+	}
+	var got []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		got = append(got, name)
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return slices.Equal(got, want), nil
 }
 
 func (st *store) close() {
@@ -371,10 +414,27 @@ func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
 		return stripPackageArchiveToExport(path, "")
 	}
 	retained, err := stripPackageArchiveToExport(path, st.retainedPath(outputID, ".a"))
-	if err != nil || retained {
+	if err != nil {
+		return false, err
+	}
+	if retained {
+		if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeExportArchive, retainedClassifierVersion); err != nil {
+			if st.verbose {
+				log.Printf("gocachez: cache retained file type failed: %v", err)
+			}
+		}
+		return true, nil
+	}
+	kind, retained, err := retainEscapedGeneratedGoSource(path, st.retainedPath(outputID, ".go"))
+	if err != nil || !retained {
 		return retained, err
 	}
-	return retainEscapedGeneratedGoSource(path, st.retainedPath(outputID, ".go"))
+	if err := st.q.updateRetainedType(context.Background(), outputID, kind, retainedClassifierVersion); err != nil {
+		if st.verbose {
+			log.Printf("gocachez: cache retained file type failed: %v", err)
+		}
+	}
+	return true, nil
 }
 
 func liveOutputID(path string) string {

@@ -30,7 +30,10 @@ ON CONFLICT(action_id) DO UPDATE SET
 	compressed_size = excluded.compressed_size,
 	created_at = excluded.created_at,
 	accessed_at = excluded.accessed_at,
-	blob_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type END`
+	blob_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type END,
+	blob_type_version = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type_version END,
+	retained_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.retained_type END,
+	retained_type_version = CASE WHEN entries.output_id = excluded.output_id THEN entries.retained_type_version END`
 
 const touchEntrySQL = `
 UPDATE entries
@@ -55,6 +58,7 @@ type catalogOutput struct {
 	size           int64
 	compressedSize int64
 	blobType       sql.NullInt64
+	retainedType   sql.NullInt64
 }
 
 func newCatalog(db catalogDB) *catalog {
@@ -240,12 +244,22 @@ FROM (
 // classification (blobType), but only for entries classified at
 // classifierVersion; classifications from older versions are treated as absent
 // so they get recomputed. blobType is only available on migrated caches.
-func (c *catalog) listOutputs(ctx context.Context, includeBlobType bool, classifierVersion int64) ([]catalogOutput, error) {
+func (c *catalog) listOutputs(
+	ctx context.Context,
+	includeBlobType bool,
+	blobClassifierVersion int64,
+	includeRetainedType bool,
+	retainedClassifierVersion int64,
+) ([]catalogOutput, error) {
 	columns := "output_id, CAST(MAX(size) AS INTEGER), CAST(MAX(compressed_size) AS INTEGER)"
 	args := []any(nil)
 	if includeBlobType {
 		columns += ", MAX(CASE WHEN blob_type_version = ? THEN blob_type END)"
-		args = append(args, classifierVersion)
+		args = append(args, blobClassifierVersion)
+	}
+	if includeRetainedType {
+		columns += ", MAX(CASE WHEN retained_type_version = ? THEN retained_type END)"
+		args = append(args, retainedClassifierVersion)
 	}
 	rows, err := c.db.QueryContext(ctx, "SELECT "+columns+" FROM entries GROUP BY output_id", args...)
 	if err != nil {
@@ -259,6 +273,9 @@ func (c *catalog) listOutputs(ctx context.Context, includeBlobType bool, classif
 		dest := []any{&output.outputID, &output.size, &output.compressedSize}
 		if includeBlobType {
 			dest = append(dest, &output.blobType)
+		}
+		if includeRetainedType {
+			dest = append(dest, &output.retainedType)
 		}
 		if err := rows.Scan(dest...); err != nil {
 			return nil, err
@@ -296,6 +313,14 @@ func (c *catalog) updateBlobType(ctx context.Context, outputID string, kind blob
 	_, err := c.db.ExecContext(ctx, `
 UPDATE entries
 SET blob_type = ?, blob_type_version = ?
+WHERE output_id = ?`, int64(kind), classifierVersion, outputID)
+	return err
+}
+
+func (c *catalog) updateRetainedType(ctx context.Context, outputID string, kind retainedTypeKind, classifierVersion int64) error {
+	_, err := c.db.ExecContext(ctx, `
+UPDATE entries
+SET retained_type = ?, retained_type_version = ?
 WHERE output_id = ?`, int64(kind), classifierVersion, outputID)
 	return err
 }

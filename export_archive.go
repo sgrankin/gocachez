@@ -174,25 +174,37 @@ func replaceFile(tmpPath, path string) error {
 	return nil
 }
 
-func retainEscapedGeneratedGoSource(path, retainedPath string) (bool, error) {
+func retainEscapedGeneratedGoSource(path, retainedPath string) (retainedTypeKind, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return false, fmt.Errorf("read live file: %w", err)
+		return 0, false, fmt.Errorf("read live file: %w", err)
 	}
-	if !isEscapedGeneratedGoSource(data) {
-		return false, nil
+	kind, ok := retainedGeneratedSourceKind(data)
+	if !ok {
+		return 0, false, nil
 	}
 	if err := installRetainedFile(data, retainedPath); err != nil {
-		return false, err
+		return 0, false, err
 	}
 	if err := replaceWithExportArchive(retainedPath, path); err != nil {
-		return false, err
+		return 0, false, err
 	}
-	return true, nil
+	return kind, true, nil
 }
 
 func isEscapedGeneratedGoSource(data []byte) bool {
-	return isGeneratedCgoSource(data) || isGeneratedTestmainSource(data)
+	_, ok := retainedGeneratedSourceKind(data)
+	return ok
+}
+
+func retainedGeneratedSourceKind(data []byte) (retainedTypeKind, bool) {
+	if isGeneratedCgoSource(data) {
+		return retainedTypeGeneratedCgoSource, true
+	}
+	if isGeneratedTestmainSource(data) {
+		return retainedTypeGeneratedTestmain, true
+	}
+	return 0, false
 }
 
 func isGeneratedCgoSource(data []byte) bool {

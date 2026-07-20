@@ -45,6 +45,12 @@ type catalogStatus struct {
 
 type retainedTypeKind int
 
+// retainedClassifierVersion identifies the behavior of retainedFileKind. Cached
+// values use this version so classification changes can invalidate them.
+const retainedClassifierVersion = 1
+
+// retainedTypeKind values are persisted in entries.retained_type. Existing
+// values must not be renumbered; append new kinds at the end.
 const (
 	retainedTypeExportArchive retainedTypeKind = iota
 	retainedTypeGeneratedCgoSource
@@ -140,7 +146,7 @@ func readStatus(cfg config) (cacheStatus, error) {
 		// from the catalog instead of walking the blobs directory.
 		status.blobFiles = status.catalog.outputs
 		status.blobTypes = blobTypeStatuses(dbPath, blobsDir, outputs)
-		status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(retainedRoot(versionDir))
+		status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs)
 		if err != nil {
 			return err
 		}
@@ -183,11 +189,15 @@ func readCatalogStatus(dbPath string) (bool, catalogStatus, []catalogOutput, err
 	}
 
 	q := newCatalog(db)
-	hasType, err := entriesHasColumn(ctx, db, "blob_type_version")
+	hasBlobType, err := entriesHasColumn(ctx, db, "blob_type_version")
 	if err != nil {
 		return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
 	}
-	outputs, err := q.listOutputs(ctx, hasType, blobClassifierVersion)
+	hasRetainedType, err := entriesHasColumn(ctx, db, "retained_type_version")
+	if err != nil {
+		return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
+	}
+	outputs, err := q.listOutputs(ctx, hasBlobType, blobClassifierVersion, hasRetainedType, retainedClassifierVersion)
 	if err != nil {
 		return false, catalogStatus{}, nil, fmt.Errorf("list catalog outputs: %w", err)
 	}
@@ -410,8 +420,15 @@ func formatAge(age time.Duration) string {
 	}
 }
 
-func readRetainedStatus(root string) (int64, int64, []retainedTypeStatus, error) {
+func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, int64, []retainedTypeStatus, error) {
 	byKind := make(map[retainedTypeKind]*retainedTypeStatus)
+	cached := make(map[string]retainedTypeKind)
+	for _, output := range outputs {
+		if output.retainedType.Valid {
+			cached[output.outputID] = retainedTypeKind(output.retainedType.Int64)
+		}
+	}
+	classified := make(map[string]retainedTypeKind)
 	var files, size int64
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -424,7 +441,16 @@ func readRetainedStatus(root string) (int64, int64, []retainedTypeStatus, error)
 		if err != nil {
 			return fmt.Errorf("stat retained file: %w", err)
 		}
-		kind := retainedFileKind(path)
+		outputID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		kind, ok := cached[outputID]
+		if !ok {
+			kind = retainedFileKind(path)
+			// Archive classification follows directly from the extension. Only
+			// source files need an expensive content-based result cached.
+			if filepath.Ext(path) == ".go" {
+				classified[outputID] = kind
+			}
+		}
 		status := byKind[kind]
 		if status == nil {
 			status = &retainedTypeStatus{
@@ -444,6 +470,9 @@ func readRetainedStatus(root string) (int64, int64, []retainedTypeStatus, error)
 	if err != nil {
 		return 0, 0, nil, err
 	}
+	if len(classified) > 0 {
+		_ = persistRetainedTypes(dbPath, classified)
+	}
 
 	statuses := make([]retainedTypeStatus, 0, len(byKind))
 	for _, status := range byKind {
@@ -458,6 +487,28 @@ func readRetainedStatus(root string) (int64, int64, []retainedTypeStatus, error)
 	return files, size, statuses, nil
 }
 
+func persistRetainedTypes(dbPath string, classified map[string]retainedTypeKind) error {
+	db, err := openDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close() //nolint:errcheck
+
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	qtx := newCatalog(db).withTx(tx)
+	for outputID, kind := range classified {
+		if err := qtx.updateRetainedType(ctx, outputID, kind, retainedClassifierVersion); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func retainedFileKind(path string) retainedTypeKind {
 	switch filepath.Ext(path) {
 	case ".a":
@@ -467,11 +518,8 @@ func retainedFileKind(path string) retainedTypeKind {
 		if err != nil {
 			return retainedTypeOther
 		}
-		if isGeneratedCgoSource(data) {
-			return retainedTypeGeneratedCgoSource
-		}
-		if isGeneratedTestmainSource(data) {
-			return retainedTypeGeneratedTestmain
+		if kind, ok := retainedGeneratedSourceKind(data); ok {
+			return kind
 		}
 	}
 	return retainedTypeOther
