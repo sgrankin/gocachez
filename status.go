@@ -120,6 +120,10 @@ func readStatus(cfg config) (cacheStatus, error) {
 	// below tolerate entries and files disappearing underneath them instead,
 	// which costs only accuracy in a report that is a snapshot of a moving
 	// cache either way.
+	//
+	// This gives up exclusion against `gocachez clean` too, not just prune.
+	// Clean removes the whole cache including the catalog, so a status racing
+	// it reports whatever survived to be read.
 	versionDir, blobsDir, liveRoot, _ := cachePaths(cfg)
 	status := cacheStatus{
 		cacheDir:   cfg.dir,
@@ -144,8 +148,8 @@ func readStatus(cfg config) (cacheStatus, error) {
 	// Blob file count matches the number of cached outputs, so derive it
 	// from the catalog instead of walking the blobs directory.
 	status.blobFiles = status.catalog.outputs
-	status.blobTypes = blobTypeStatuses(dbPath, blobsDir, outputs)
-	status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs)
+	status.blobTypes = blobTypeStatuses(dbPath, blobsDir, outputs, cfg.verbose)
+	status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs, cfg.verbose)
 	if err != nil {
 		return cacheStatus{}, err
 	}
@@ -166,6 +170,11 @@ func readCatalogStatus(dbPath string) (bool, catalogStatus, []catalogOutput, err
 	}
 
 	db, err := openExistingDB(dbPath)
+	if errors.Is(err, os.ErrNotExist) {
+		// `clean` can remove the catalog between the check above and here.
+		// That is the same observation as finding no catalog at all.
+		return false, catalogStatus{}, nil, nil
+	}
 	if err != nil {
 		return false, catalogStatus{}, nil, err
 	}
@@ -417,7 +426,7 @@ func formatAge(age time.Duration) string {
 	}
 }
 
-func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, int64, []retainedTypeStatus, error) {
+func readRetainedStatus(dbPath, root string, outputs []catalogOutput, verbose bool) (int64, int64, []retainedTypeStatus, error) {
 	byKind := make(map[retainedTypeKind]*retainedTypeStatus)
 	cached := make(map[string]retainedTypeKind)
 	for _, output := range outputs {
@@ -427,24 +436,9 @@ func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, in
 	}
 	classified := make(map[string]retainedTypeKind)
 	var files, size int64
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			// A concurrent prune may remove a file or shard between the readdir
-			// and the visit. Skip what is already gone rather than failing the
-			// whole report.
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
+	visit := func(path string, d os.DirEntry) error {
 		info, err := d.Info()
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
 			return fmt.Errorf("stat retained file: %w", err)
 		}
 		outputID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
@@ -469,14 +463,24 @@ func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, in
 		files++
 		size += info.Size()
 		return nil
-	})
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, 0, nil, nil
 	}
+
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			err = visit(path, d)
+		}
+		// A concurrent prune can take a file, or a whole shard, between the
+		// readdir and the visit — and the root itself may never have existed.
+		// Report what is still there rather than failing.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	})
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	persistClassifications(dbPath, updateRetainedTypeSQL, retainedClassifierVersion, classified)
+	persistClassifications(dbPath, retainedClassifier, classified, verbose)
 
 	statuses := make([]retainedTypeStatus, 0, len(byKind))
 	for _, status := range byKind {
@@ -490,7 +494,6 @@ func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, in
 	})
 	return files, size, statuses, nil
 }
-
 
 func retainedFileKind(path string) retainedTypeKind {
 	switch filepath.Ext(path) {
@@ -522,13 +525,18 @@ func readLiveStatus(liveRoot string) (int64, int64, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		runLock := flock.New(filepath.Join(liveRoot, entry.Name(), "run.lock"))
+		// Without O_CREATE this reports a missing lock rather than creating
+		// one. flock.New defaults to creating it, which would have status —
+		// a read-only report — resurrect run dirs that a concurrent prune is
+		// midway through removing, making its own rmdir fail and leaving the
+		// run to show up as inactive until maxAge elapses.
+		runLock := flock.New(filepath.Join(liveRoot, entry.Name(), "run.lock"), flock.SetFlag(os.O_RDONLY))
 		locked, err := runLock.TryLock()
 		if err != nil {
 			_ = runLock.Close()
-			// A concurrent prune may reclaim the run dir between the readdir
-			// and the lock attempt; a run that no longer exists counts as
-			// neither active nor inactive.
+			// A prune may reclaim the run between the readdir and the lock
+			// attempt; a run that no longer exists counts as neither active
+			// nor inactive.
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}

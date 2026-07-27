@@ -12,8 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1231,6 +1234,53 @@ func TestPruneSkipsScanWithinInterval(t *testing.T) {
 	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
 		t.Fatalf("orphan blob stat err = %v, want not exist", err)
 	}
+	// The stamp is rewritten in place, so the refresh depends on the write
+	// bumping mtime even though the size does not change. If it ever stops
+	// doing so the gate never reopens and maintenance silently stops.
+	info, err := os.Stat(pruneStampPath(st.versionDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if age := time.Since(info.ModTime()); age >= pruneInterval {
+		t.Fatalf("scan left the stamp %v old, want refreshed", age)
+	}
+}
+
+func TestPruneSkipsWithoutWaitingForTheLifecycleLock(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stand in for another process mid-scan. A prune with nothing to do must
+	// not queue behind it — that wait is the exit-time stall the gate exists
+	// to remove, so the stamp has to be checked before the lock is taken.
+	lock := flock.New(st.lifecycleLockPath)
+	if err := lock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close() //nolint:errcheck
+
+	done := make(chan error, 1)
+	go func() { done <- st.prune() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("prune waited for the lifecycle lock with a fresh stamp")
+	}
 }
 
 func TestPruneScansEarlyWhenRunInstallsLargeShareOfBudget(t *testing.T) {
@@ -1253,7 +1303,23 @@ func TestPruneScansEarlyWhenRunInstallsLargeShareOfBudget(t *testing.T) {
 	// A fresh stamp would normally hold the scan off for pruneInterval, but a
 	// run that adds this much of the budget cannot wait without overshooting.
 	blobPath := orphanBlob(t, st, strings.Repeat("b", 64))
-	st.installed.Add(maxSize/pruneOvershootDivisor + 1)
+	body := bytes.Repeat([]byte("cache me"), 256)
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{93}, 32),
+		OutputID: bytes.Repeat([]byte{94}, 32),
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	// put must be what feeds the gate; without this wiring the escape hatch
+	// can never fire in production no matter what the threshold is.
+	put := st.installed.Load()
+	if put <= 0 {
+		t.Fatalf("installed = %d after a put, want the put's compressed size", put)
+	}
+	st.installed.Add(maxSize/pruneOvershootDivisor + 1 - put)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -2084,7 +2150,7 @@ func TestRunStatusDoesNotWaitForLifecycleLock(t *testing.T) {
 	assertContains(t, stdout.String(), "Cached outputs      1")
 }
 
-func TestStatusToleratesConcurrentlyRemovedFiles(t *testing.T) {
+func TestStatusSkipsRunDirWithoutLockFile(t *testing.T) {
 	t.Parallel()
 
 	cacheDir := t.TempDir()
@@ -2092,26 +2158,14 @@ func TestStatusToleratesConcurrentlyRemovedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	outputID := bytes.Repeat([]byte{84}, 32)
-	body := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 1024))
-	if _, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: bytes.Repeat([]byte{83}, 32),
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body))); err != nil {
-		t.Fatal(err)
-	}
 	st.close()
 
-	// Without the lifecycle lock, a prune can delete these between the readdir
-	// and the visit. Deleting them outright is the same case, taken to its
-	// limit: status must report what is left, not fail.
-	if err := os.RemoveAll(retainedRoot(filepath.Join(cacheDir, "v1"))); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(filepath.Join(cacheDir, "v1", "live")); err != nil {
+	// A prune removing a run dir unlinks run.lock before the dir itself, so
+	// status can see the dir in that state. It must neither fail nor recreate
+	// the lock: doing so would make the prune's rmdir fail and resurrect the
+	// run in the report.
+	runDir := filepath.Join(cacheDir, "v1", "live", "run-halfremoved")
+	if err := os.MkdirAll(runDir, 0o777); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2120,6 +2174,71 @@ func TestStatusToleratesConcurrentlyRemovedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertContains(t, stdout.String(), "Live runs           0 active, 0 inactive")
+	if _, err := os.Stat(filepath.Join(runDir, "run.lock")); !os.IsNotExist(err) {
+		t.Fatalf("status created run.lock: stat err = %v, want not exist", err)
+	}
+}
+
+func TestStatusToleratesRetainedFilesRemovedDuringWalk(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 16))
+	retained := make([]string, 0, 400)
+	for i := range 400 {
+		action := sha256.Sum256(fmt.Appendf(nil, "walk-action-%d", i))
+		output := sha256.Sum256(fmt.Appendf(nil, "walk-output-%d", i))
+		if _, err := st.put(request{
+			ID:       int64(i),
+			Command:  cmdPut,
+			ActionID: action[:],
+			OutputID: output[:],
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+		retained = append(retained, retainedPath(cacheDir, output[:], ".a"))
+	}
+	st.close()
+
+	// Delete retained files while the report walks them, which is exactly what
+	// a concurrent prune does now that status holds no lock. Split by shard,
+	// not by file: taking a whole shard directory is a failing descent, while
+	// unlinking within a surviving shard is a failing stat, and those are
+	// different branches of the walk. Splitting by file would let the removed
+	// directories hide the files the stat branch needs.
+	byShard := map[string][]string{}
+	for _, path := range retained {
+		dir := filepath.Dir(path)
+		byShard[dir] = append(byShard[dir], path)
+	}
+	shards := slices.Sorted(maps.Keys(byShard))
+
+	deleted := make(chan struct{})
+	go func() {
+		defer close(deleted)
+		for i, shard := range shards {
+			if i%2 == 0 {
+				_ = os.RemoveAll(shard)
+				continue
+			}
+			for _, path := range byShard[shard] {
+				_ = os.Remove(path)
+			}
+		}
+	}()
+
+	var stdout bytes.Buffer
+	err = run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout)
+	<-deleted
+	if err != nil {
+		t.Fatalf("status failed while retained files were being removed: %v", err)
+	}
+	assertContains(t, stdout.String(), "Cached outputs      400")
 }
 
 func TestRunStatusActiveCache(t *testing.T) {
@@ -2378,6 +2497,39 @@ func TestStatusCachesClassificationsPastOneBatch(t *testing.T) {
 	assertBlobKind(t, statuses, blobTypeGoSource, outputs)
 }
 
+// Not parallel: it swaps the global log sink to observe the warning.
+func TestPersistClassificationsReportsFailure(t *testing.T) {
+	// A persist that cannot open the catalog has to say so. Discarding this
+	// error is what let a cache sit permanently in the reclassify-everything
+	// path with no way to tell.
+	dbPath := filepath.Join(t.TempDir(), "missing-dir", "cache.db")
+	classified := map[string]blobTypeKind{strings.Repeat("a", 64): blobTypeGoSource}
+
+	if err := writeClassifications(dbPath, blobClassifier, classified); err == nil {
+		t.Fatal("writeClassifications succeeded against an unwritable catalog path")
+	}
+
+	var logged bytes.Buffer
+	flags := log.Flags()
+	log.SetOutput(&logged)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(flags)
+	})
+
+	persistClassifications(dbPath, blobClassifier, classified, true)
+	if !strings.Contains(logged.String(), "caching classifications failed") {
+		t.Fatalf("verbose persist logged %q, want a failure warning", logged.String())
+	}
+
+	logged.Reset()
+	persistClassifications(dbPath, blobClassifier, classified, false)
+	if logged.Len() != 0 {
+		t.Fatalf("non-verbose persist logged %q, want silence", logged.String())
+	}
+}
+
 func TestStatusReclassifiesWhenClassifierVersionChanges(t *testing.T) {
 	t.Parallel()
 
@@ -2466,7 +2618,7 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, statuses, err := readRetainedStatus(dbPath, retainedRoot(versionDir), outputs)
+	_, _, statuses, err := readRetainedStatus(dbPath, retainedRoot(versionDir), outputs, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2490,7 +2642,7 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, statuses, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs)
+	_, _, statuses, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs, false)
 	if err != nil {
 		t.Fatal(err)
 	}

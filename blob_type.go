@@ -67,15 +67,15 @@ func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	return blobTypeStatuses(dbPath, blobsDir, outputs), nil
+	return blobTypeStatuses(dbPath, blobsDir, outputs, false), nil
 }
 
 // blobTypeStatuses classifies the given catalog outputs into the per-kind
 // breakdown, decompressing only blobs without a current cached classification
 // and caching any it computes.
-func blobTypeStatuses(dbPath, blobsDir string, outputs []catalogOutput) []blobTypeStatus {
+func blobTypeStatuses(dbPath, blobsDir string, outputs []catalogOutput, verbose bool) []blobTypeStatus {
 	byKind, classified := classifyBlobTypes(blobsDir, outputs)
-	persistClassifications(dbPath, updateBlobTypeSQL, blobClassifierVersion, classified)
+	persistClassifications(dbPath, blobClassifier, classified, verbose)
 
 	statuses := make([]blobTypeStatus, 0, len(byKind))
 	for _, status := range byKind {

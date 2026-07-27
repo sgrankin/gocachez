@@ -67,8 +67,7 @@ func newCatalog(db catalogDB) *catalog {
 }
 
 // prepare caches the hot-path statements on a persistent *sql.DB connection.
-// It is a no-op for transaction-backed catalogs (from withTx), which fall back
-// to parsing per call.
+// It is a no-op for any other catalogDB, which falls back to parsing per call.
 func (c *catalog) prepare(ctx context.Context) error {
 	db, ok := c.db.(*sql.DB)
 	if !ok {
@@ -326,6 +325,21 @@ func (c *catalog) updateRetainedType(ctx context.Context, outputID string, kind 
 	return err
 }
 
+// classifier pairs an update statement with the classifier version whose
+// output it stores. Binding them in one value keeps a caller from writing blob
+// kinds into retained_type, or stamping either column with the other's
+// version; the type parameter ties the pair to the kind it accepts.
+type classifier[K ~int] struct {
+	// updateSQL must bind (kind, version, outputID) in that order.
+	updateSQL string
+	version   int64
+}
+
+var (
+	blobClassifier     = classifier[blobTypeKind]{updateBlobTypeSQL, blobClassifierVersion}
+	retainedClassifier = classifier[retainedTypeKind]{updateRetainedTypeSQL, retainedClassifierVersion}
+)
+
 // classificationBatch bounds how many rows one transaction updates. Status can
 // classify the entire cache in a single pass, and SQLite has one write slot:
 // committing that as a single transaction held it long enough to stall a
@@ -337,17 +351,19 @@ const classificationBatch = 1000
 // reclassifying. Batches commit independently, so a failure part way through
 // still leaves the earlier ones cached and shrinks the next run's work.
 //
-// Failures are warned about rather than returned: the report the caller is
-// building is correct either way, only the next run's cost is affected. They
-// must not be silent, though — a persist that keeps losing the write race to
-// concurrent builds leaves status reclassifying the whole cache every time.
-func persistClassifications[K ~int](dbPath, updateSQL string, version int64, classified map[string]K) {
-	if err := writeClassifications(dbPath, updateSQL, version, classified); err != nil {
+// Failures are logged rather than returned: the report the caller is building
+// is correct either way, only the next run's cost is affected. Logging is
+// gated like the store's other maintenance chatter, but it must exist — a
+// persist that keeps losing the write race to concurrent builds leaves status
+// reclassifying the whole cache every time, and discarding the error made that
+// undiagnosable.
+func persistClassifications[K ~int](dbPath string, c classifier[K], classified map[string]K, verbose bool) {
+	if err := writeClassifications(dbPath, c, classified); err != nil && verbose {
 		log.Printf("gocachez: caching classifications failed, the next status will redo this work: %v", err)
 	}
 }
 
-func writeClassifications[K ~int](dbPath, updateSQL string, version int64, classified map[string]K) error {
+func writeClassifications[K ~int](dbPath string, c classifier[K], classified map[string]K) error {
 	if len(classified) == 0 {
 		return nil
 	}
@@ -358,7 +374,7 @@ func writeClassifications[K ~int](dbPath, updateSQL string, version int64, class
 	defer db.Close() //nolint:errcheck
 
 	ctx := context.Background()
-	stmt, err := db.PrepareContext(ctx, updateSQL)
+	stmt, err := db.PrepareContext(ctx, c.updateSQL)
 	if err != nil {
 		return fmt.Errorf("prepare classification update: %w", err)
 	}
@@ -370,12 +386,12 @@ func writeClassifications[K ~int](dbPath, updateSQL string, version int64, class
 		if len(batch) < classificationBatch {
 			continue
 		}
-		if err := commitClassifications(ctx, db, stmt, version, batch); err != nil {
+		if err := commitClassifications(ctx, db, stmt, c.version, batch); err != nil {
 			return err
 		}
 		clear(batch)
 	}
-	return commitClassifications(ctx, db, stmt, version, batch)
+	return commitClassifications(ctx, db, stmt, c.version, batch)
 }
 
 func commitClassifications[K ~int](ctx context.Context, db *sql.DB, stmt *sql.Stmt, version int64, batch map[string]K) error {

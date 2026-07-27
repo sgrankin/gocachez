@@ -71,9 +71,11 @@ type store struct {
 	decoderPool       sync.Pool
 	materialized      map[string]string
 	accessed          map[string]int64
-	// installed counts compressed bytes this run added to the cache, so a build
-	// large enough to overshoot maxSize can force a maintenance scan on the way
-	// out instead of waiting for pruneInterval.
+	// installed counts compressed bytes this run put, so a build large enough
+	// to overshoot maxSize can force a maintenance scan on the way out instead
+	// of waiting for pruneInterval. It counts puts rather than growth — a put
+	// of an output already in the cache adds nothing — which only ever errs
+	// toward scanning sooner.
 	installed atomic.Int64
 }
 

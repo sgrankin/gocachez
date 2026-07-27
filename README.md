@@ -173,6 +173,15 @@ Age-based pruning is independent of `maxSize`: entries and retained files that
 have not been used within `maxAge` are trimmed even while the cache is under its
 size limit.
 
+Both limits are enforced by a maintenance scan that runs at most once an hour,
+and only when no build is using the cache — the scan is proportional to the size
+of the cache, and the `go` command waits for `gocachez` to exit, so running it on
+every build would add that cost to every build. `maxSize` is therefore a target
+rather than a hard cap: the cache can exceed it between scans. A single build
+that writes a large fraction of `maxSize` scans on its way out instead of waiting
+for the next interval, but many smaller builds can still drift past the limit
+until the next scan brings the cache back under it.
+
 **Verbose maintenance logs**
 
 - Config: `verbose`

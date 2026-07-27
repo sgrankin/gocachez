@@ -36,12 +36,17 @@ const (
 	// gating it costs nothing but latency. cmd/go gates its own cache trim the
 	// same way, with a 24h interval; gocachez uses a shorter one because it
 	// also enforces a size budget.
+	//
+	// The interval is a lower bound on the gap between scans, not an upper
+	// bound: a scan also requires the cache to be momentarily idle (see
+	// pruneLocked), so a machine that always has a build running defers it.
 	pruneInterval = time.Hour
 
-	// pruneOvershootDivisor bounds how far the cache can drift past maxSize
-	// between interval-driven scans: a run that installs more than
-	// maxSize/pruneOvershootDivisor of new blobs scans on the way out rather
-	// than waiting for pruneInterval.
+	// pruneOvershootDivisor caps how far a *single* run can push the cache past
+	// maxSize before it scans on the way out instead of waiting for
+	// pruneInterval. It does not bound aggregate drift: several runs each
+	// installing less than maxSize/pruneOvershootDivisor still add up between
+	// interval-driven scans.
 	pruneOvershootDivisor = 16
 )
 
