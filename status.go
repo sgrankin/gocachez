@@ -113,7 +113,14 @@ func writeStatus(cfg config, w io.Writer) error {
 }
 
 func readStatus(cfg config) (cacheStatus, error) {
-	versionDir, blobsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
+	// Status deliberately does not take the lifecycle lock, so it has no use
+	// for its path. Reading the cache is O(cache) — it decompresses
+	// unclassified blobs and walks the retained tree — and holding the lock
+	// that long stalls every build that starts or exits meanwhile. The readers
+	// below tolerate entries and files disappearing underneath them instead,
+	// which costs only accuracy in a report that is a snapshot of a moving
+	// cache either way.
+	versionDir, blobsDir, liveRoot, _ := cachePaths(cfg)
 	status := cacheStatus{
 		cacheDir:   cfg.dir,
 		maxSize:    cfg.maxSize,
@@ -127,32 +134,22 @@ func readStatus(cfg config) (cacheStatus, error) {
 		return cacheStatus{}, fmt.Errorf("stat cache version dir: %w", err)
 	}
 
-	st := &store{
-		config:            cfg,
-		versionDir:        versionDir,
-		blobsDir:          blobsDir,
-		liveRoot:          liveRoot,
-		lifecycleLockPath: lifecycleLockPath,
+	var err error
+	dbPath := filepath.Join(versionDir, "cache.db")
+	var outputs []catalogOutput
+	status.catalogExists, status.catalog, outputs, err = readCatalogStatus(dbPath)
+	if err != nil {
+		return cacheStatus{}, err
 	}
-	err := st.withLifecycleLock(func() error {
-		var err error
-		dbPath := filepath.Join(versionDir, "cache.db")
-		var outputs []catalogOutput
-		status.catalogExists, status.catalog, outputs, err = readCatalogStatus(dbPath)
-		if err != nil {
-			return err
-		}
-		// Blob file count matches the number of cached outputs, so derive it
-		// from the catalog instead of walking the blobs directory.
-		status.blobFiles = status.catalog.outputs
-		status.blobTypes = blobTypeStatuses(dbPath, blobsDir, outputs)
-		status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs)
-		if err != nil {
-			return err
-		}
-		status.activeLiveRuns, status.inactiveLiveRuns, err = readLiveStatus(liveRoot)
-		return err
-	})
+	// Blob file count matches the number of cached outputs, so derive it
+	// from the catalog instead of walking the blobs directory.
+	status.blobFiles = status.catalog.outputs
+	status.blobTypes = blobTypeStatuses(dbPath, blobsDir, outputs)
+	status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs)
+	if err != nil {
+		return cacheStatus{}, err
+	}
+	status.activeLiveRuns, status.inactiveLiveRuns, err = readLiveStatus(liveRoot)
 	if err != nil {
 		return cacheStatus{}, err
 	}
@@ -432,6 +429,12 @@ func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, in
 	var files, size int64
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			// A concurrent prune may remove a file or shard between the readdir
+			// and the visit. Skip what is already gone rather than failing the
+			// whole report.
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		if d.IsDir() {
@@ -439,6 +442,9 @@ func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, in
 		}
 		info, err := d.Info()
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
 			return fmt.Errorf("stat retained file: %w", err)
 		}
 		outputID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
@@ -543,6 +549,12 @@ func readLiveStatus(liveRoot string) (int64, int64, error) {
 		locked, err := runLock.TryLock()
 		if err != nil {
 			_ = runLock.Close()
+			// A concurrent prune may reclaim the run dir between the readdir
+			// and the lock attempt; a run that no longer exists counts as
+			// neither active nor inactive.
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return 0, 0, fmt.Errorf("try lock live run %s: %w", entry.Name(), err)
 		}
 		if !locked {

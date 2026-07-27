@@ -2042,6 +2042,86 @@ func TestRunStatusInactiveCache(t *testing.T) {
 	assertContains(t, got, "Text files      1        4B")
 }
 
+func TestRunStatusDoesNotWaitForLifecycleLock(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{81}, 32),
+		OutputID: bytes.Repeat([]byte{82}, 32),
+		BodySize: 4,
+	}, bufio.NewReader(encodedBody([]byte("body")))); err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	// Stand in for a build holding the lock across a maintenance scan.
+	lock := flock.New(filepath.Join(cacheDir, "v1", "lifecycle.lock"))
+	if err := lock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close() //nolint:errcheck
+
+	done := make(chan error, 1)
+	var stdout bytes.Buffer
+	go func() {
+		done <- run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("status blocked on the lifecycle lock")
+	}
+	assertContains(t, stdout.String(), "Cached outputs      1")
+}
+
+func TestStatusToleratesConcurrentlyRemovedFiles(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputID := bytes.Repeat([]byte{84}, 32)
+	body := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 1024))
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{83}, 32),
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	// Without the lifecycle lock, a prune can delete these between the readdir
+	// and the visit. Deleting them outright is the same case, taken to its
+	// limit: status must report what is left, not fail.
+	if err := os.RemoveAll(retainedRoot(filepath.Join(cacheDir, "v1"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(cacheDir, "v1", "live")); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	assertContains(t, stdout.String(), "Live runs           0 active, 0 inactive")
+}
+
 func TestRunStatusActiveCache(t *testing.T) {
 	t.Parallel()
 
