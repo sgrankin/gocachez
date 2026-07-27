@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -70,6 +71,10 @@ type store struct {
 	decoderPool       sync.Pool
 	materialized      map[string]string
 	accessed          map[string]int64
+	// installed counts compressed bytes this run added to the cache, so a build
+	// large enough to overshoot maxSize can force a maintenance scan on the way
+	// out instead of waiting for pruneInterval.
+	installed atomic.Int64
 }
 
 const retainedDirName = "retained"
@@ -109,6 +114,12 @@ func cacheVersionDir(cfg config) string {
 
 func retainedRoot(versionDir string) string {
 	return filepath.Join(versionDir, retainedDirName)
+}
+
+// pruneStampPath names the file whose mtime records the last completed
+// maintenance scan. Only the mtime matters; the contents are always empty.
+func pruneStampPath(versionDir string) string {
+	return filepath.Join(versionDir, "prune.stamp")
 }
 
 func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPath string) (*store, error) {

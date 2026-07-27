@@ -87,7 +87,7 @@ func (st *store) cleanLocked() error {
 	if err := os.RemoveAll(retainedRoot(st.versionDir)); err != nil {
 		return fmt.Errorf("remove retained dir: %w", err)
 	}
-	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm", pruneStampPath(st.versionDir)} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove catalog file: %w", err)
 		}

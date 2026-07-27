@@ -27,6 +27,22 @@ const (
 	// at most once per interval to avoid churn. The age cutoff itself is the
 	// configurable maxAge (see config); the default matches GOCACHE's 5 days.
 	mtimeInterval = time.Hour
+
+	// pruneInterval bounds how often the maintenance scan runs. The scan is
+	// O(cache) — it walks the retained tree, aggregates the catalog, and
+	// reconciles every blob shard against it — and the go command waits for
+	// gocachez to exit before it finishes, so running it on every build adds
+	// that cost to every build. Its results barely change between builds, so
+	// gating it costs nothing but latency. cmd/go gates its own cache trim the
+	// same way, with a 24h interval; gocachez uses a shorter one because it
+	// also enforces a size budget.
+	pruneInterval = time.Hour
+
+	// pruneOvershootDivisor bounds how far the cache can drift past maxSize
+	// between interval-driven scans: a run that installs more than
+	// maxSize/pruneOvershootDivisor of new blobs scans on the way out rather
+	// than waiting for pruneInterval.
+	pruneOvershootDivisor = 16
 )
 
 var decoderOptions = []zstd.DOption{
@@ -117,6 +133,7 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	if err != nil {
 		return response{}, err
 	}
+	st.installed.Add(compressedSize)
 
 	now := time.Now()
 	ent := entry{
@@ -355,7 +372,37 @@ func (st *store) deleteOutput(outputID string) error {
 }
 
 func (st *store) prune() error {
+	// Check the stamp before taking the lock. Skipping is the common case, and
+	// the lock may be held by another process's scan; blocking on it here would
+	// stall this process's exit for exactly as long as the scan we are about to
+	// decline to repeat.
+	if !st.pruneDue(time.Now()) {
+		return nil
+	}
 	return st.withLifecycleLock(st.pruneLocked)
+}
+
+// pruneDue reports whether the maintenance scan should run. A stamp dated in
+// the future — clock skew, a restored backup — counts as due, so a bad
+// timestamp can never lock maintenance out permanently.
+func (st *store) pruneDue(now time.Time) bool {
+	if st.maxSize > 0 && st.installed.Load() > st.maxSize/pruneOvershootDivisor {
+		return true
+	}
+	info, err := os.Stat(pruneStampPath(st.versionDir))
+	if err != nil {
+		return true
+	}
+	age := now.Sub(info.ModTime())
+	return age >= pruneInterval || age < 0
+}
+
+func (st *store) markPruned() error {
+	if err := os.WriteFile(pruneStampPath(st.versionDir), nil, 0o666); err != nil {
+		return fmt.Errorf("write prune stamp: %w", err)
+	}
+	st.installed.Store(0)
+	return nil
 }
 
 func (st *store) pruneLocked() error {
@@ -369,6 +416,17 @@ func (st *store) pruneLocked() error {
 	if activeRuns > 0 {
 		return nil
 	}
+	// Another process may have finished a scan while we waited for the lock.
+	if !st.pruneDue(time.Now()) {
+		return nil
+	}
+	if err := st.pruneScan(); err != nil {
+		return err
+	}
+	return st.markPruned()
+}
+
+func (st *store) pruneScan() error {
 	if err := st.pruneOldRetainedFiles(time.Now()); err != nil {
 		return err
 	}
@@ -378,15 +436,22 @@ func (st *store) pruneLocked() error {
 	if err := st.pruneOldEntries(time.Now()); err != nil {
 		return err
 	}
+	if err := st.pruneToMaxSize(); err != nil {
+		return err
+	}
+	return st.removeOrphanOutputFiles(true)
+}
+
+func (st *store) pruneToMaxSize() error {
 	if st.maxSize <= 0 {
-		return st.removeOrphanOutputFiles(true)
+		return nil
 	}
 	total, err := st.compressedSize()
 	if err != nil {
 		return err
 	}
 	if total <= st.maxSize {
-		return st.removeOrphanOutputFiles(true)
+		return nil
 	}
 
 	candidates, err := st.pruneCandidates()
@@ -410,8 +475,7 @@ func (st *store) pruneLocked() error {
 	if st.verbose && removed > 0 {
 		log.Printf("gocachez: pruned %d blobs, compressed size now %s", removed, formatSize(total))
 	}
-
-	return st.removeOrphanOutputFiles(true)
+	return nil
 }
 
 type pruneCandidate struct {

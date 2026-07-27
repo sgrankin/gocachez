@@ -781,6 +781,7 @@ func TestPruneRemovesOrphanRetainedFiles(t *testing.T) {
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
+	expirePruneStamp(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -835,6 +836,7 @@ func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
+	expirePruneStamp(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -877,6 +879,7 @@ func TestRefreshingRetainedFileDoesNotKeepOldLiveRun(t *testing.T) {
 	if err := os.Chtimes(filepath.Join(filepath.Dir(first.DiskPath), "run.lock"), old, old); err != nil {
 		t.Fatal(err)
 	}
+	expirePruneStamp(t, filepath.Join(cacheDir, "v1"))
 
 	st, err = newStore(config{
 		dir:    cacheDir,
@@ -1168,18 +1171,122 @@ func TestPruneRemovesOrphanBlobsWithSizePruningDisabled(t *testing.T) {
 	}
 	defer st.close()
 
-	outputID := strings.Repeat("a", 64)
-	blobDir := st.blobDir(outputID)
-	if err := os.MkdirAll(blobDir, 0o777); err != nil {
-		t.Fatal(err)
-	}
-	blobPath := st.blobPath(outputID)
-	if err := os.WriteFile(blobPath, []byte("orphan"), 0o666); err != nil {
-		t.Fatal(err)
-	}
+	blobPath := orphanBlob(t, st, strings.Repeat("a", 64))
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+	}
+}
+
+// orphanBlob writes a blob file with no catalog entry, which only a
+// maintenance scan removes.
+func orphanBlob(t *testing.T, st *store, outputID string) string {
+	t.Helper()
+	if err := os.MkdirAll(st.blobDir(outputID), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	path := st.blobPath(outputID)
+	if err := os.WriteFile(path, []byte("orphan"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestPruneSkipsScanWithinInterval(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pruneStampPath(st.versionDir)); err != nil {
+		t.Fatalf("prune did not stamp: %v", err)
+	}
+
+	blobPath := orphanBlob(t, st, strings.Repeat("a", 64))
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("prune scanned within pruneInterval: %v", err)
+	}
+
+	expirePruneStamp(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+	}
+}
+
+func TestPruneScansEarlyWhenRunInstallsLargeShareOfBudget(t *testing.T) {
+	t.Parallel()
+
+	const maxSize = 16 << 10
+	st, err := newStore(config{dir: t.TempDir(), maxSize: maxSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh stamp would normally hold the scan off for pruneInterval, but a
+	// run that adds this much of the budget cannot wait without overshooting.
+	blobPath := orphanBlob(t, st, strings.Repeat("b", 64))
+	st.installed.Add(maxSize/pruneOvershootDivisor + 1)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+	}
+	if got := st.installed.Load(); got != 0 {
+		t.Fatalf("installed = %d after scan, want 0", got)
+	}
+}
+
+func TestPruneScansWhenStampIsDatedInTheFuture(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Clock skew or a restored backup must not lock maintenance out.
+	ahead := time.Now().Add(24 * time.Hour)
+	if err := os.Chtimes(pruneStampPath(st.versionDir), ahead, ahead); err != nil {
+		t.Fatal(err)
+	}
+	blobPath := orphanBlob(t, st, strings.Repeat("c", 64))
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -3248,6 +3355,16 @@ func readExportData(t *testing.T, path string) []byte {
 func retainedPath(cacheDir string, outputID []byte, ext string) string {
 	outputHex := hexOf(outputID)
 	return filepath.Join(cacheDir, "v1", retainedDirName, outputHex[:2], outputHex+ext)
+}
+
+// expirePruneStamp backdates the maintenance stamp, standing in for the
+// passage of pruneInterval so the next prune scans instead of skipping.
+func expirePruneStamp(t *testing.T, versionDir string) {
+	t.Helper()
+	old := time.Now().Add(-2 * pruneInterval)
+	if err := os.Chtimes(pruneStampPath(versionDir), old, old); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
 }
 
 func errorsIs(err, target error) bool {
