@@ -56,12 +56,16 @@ func (st *store) cleanLocked() error {
 		// Clean holds the lifecycle lock throughout, so planning and removal
 		// see the same cache; the re-check inside removeOrphans is redundant
 		// here and harmless.
-		orphans, err := st.planOrphans(false, 0)
+		orphans, err := st.planOrphans(false, keepEveryEntry)
 		if err != nil {
 			_ = st.db.Close()
 			return err
 		}
 		if err := st.removeOrphans(orphans); err != nil {
+			_ = st.db.Close()
+			return err
+		}
+		if err := removeEmptyDirs(retainedRoot(st.versionDir)); err != nil {
 			_ = st.db.Close()
 			return err
 		}

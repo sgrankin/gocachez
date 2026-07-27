@@ -206,11 +206,14 @@ func (c *catalog) touchEntries(ctx context.Context, tx *sql.Tx, accessed map[str
 	return nil
 }
 
-func (c *catalog) deleteEntriesByOutputID(ctx context.Context, outputID string) error {
-	_, err := c.db.ExecContext(ctx, `
+func (c *catalog) deleteEntriesByOutputID(ctx context.Context, outputID string) (int64, error) {
+	res, err := c.db.ExecContext(ctx, `
 DELETE FROM entries
 WHERE output_id = ?`, outputID)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (c *catalog) deleteEntriesAccessedBefore(ctx context.Context, cutoff int64) (int64, error) {

@@ -11,9 +11,11 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -383,7 +385,7 @@ func (st *store) deleteOutput(outputID string) error {
 	if err := os.Remove(st.blobPath(outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove bad blob: %w", err)
 	}
-	if err := st.q.deleteEntriesByOutputID(context.Background(), outputID); err != nil {
+	if _, err := st.q.deleteEntriesByOutputID(context.Background(), outputID); err != nil {
 		return fmt.Errorf("delete bad output entries: %w", err)
 	}
 	st.deleteMaterialized(outputID)
@@ -403,14 +405,34 @@ func (st *store) deleteOutput(outputID string) error {
 // removal safe, and applyPrune re-confirms that under the lock. Because the
 // analysis ran unlocked, applyPrune also re-verifies what it is about to
 // delete — see prunePlan.
+//
+// That invariant has one gap, and it predates the split: unregisterRun deletes
+// its row before writing retained files and stamping run.lock, so a closing
+// store can still touch the cache while counting as idle. It holds its own
+// run.lock throughout, and entries for anything it retains are freshly
+// accessed, so the reachable outcome is a lost retained file rather than a lost
+// blob or a dangling row.
 func (st *store) prune() error {
 	// Check the stamp before anything else: skipping is the common case.
 	if !st.pruneDue(time.Now()) {
 		return nil
 	}
+	// Serialise scans on a lock of their own. Analysis is expensive and its
+	// result is discarded if someone else stamps first, so a second scanner
+	// should skip rather than duplicate the work. This is deliberately not the
+	// lifecycle lock: a build opening a store must never wait on maintenance.
+	scanned, err := withFileLockIfFree(maintenanceLockPath(st.versionDir), st.scan)
+	if err == nil && !scanned && st.verbose {
+		log.Print("gocachez: skipped maintenance, another process is already scanning")
+	}
+	return err
+}
+
+func (st *store) scan() error {
 	// Analysing a cache that other builds are still using is wasted work, and
-	// applyPrune would decline to delete anyway. Purely an optimisation — the
-	// authoritative check happens under the lock.
+	// applyPrune would decline to delete anyway. A run row left behind by a
+	// killed helper defers the scan to the next exit, which reclaims it in
+	// newStore; the authoritative check happens under the lifecycle lock.
 	active, err := st.q.countRuns(context.Background())
 	if err != nil {
 		return fmt.Errorf("count active runs: %w", err)
@@ -465,6 +487,10 @@ func (st *store) markPruned() error {
 //     matter — a put writes its blob before inserting the row, so a blob can be
 //     unreferenced during the walk and referenced by the time we delete.
 type prunePlan struct {
+	// cutoff is the age boundary the plan was built against. Deletion re-reads
+	// mtimes but compares them to this, so the re-check can only ever keep more
+	// than the plan chose, never less.
+	cutoff      time.Time
 	entryCutoff int64            // delete entries unused since this; 0 for none
 	retained    []string         // expired retained files
 	liveRuns    []string         // expired retained live run dirs
@@ -481,7 +507,7 @@ func (p prunePlan) empty() bool {
 }
 
 func (st *store) planPrune(now time.Time) (prunePlan, error) {
-	var plan prunePlan
+	plan := prunePlan{cutoff: trimCutoff(st.maxAge, now)}
 	var err error
 	if plan.entryCutoff, err = st.planOldEntries(now); err != nil {
 		return prunePlan{}, err
@@ -541,15 +567,21 @@ func (st *store) deletePlanned(plan prunePlan) error {
 	if err := st.pruneOldEntries(plan.entryCutoff); err != nil {
 		return err
 	}
-	if err := st.removeExpiredRetainedFiles(plan.retained); err != nil {
+	if err := st.removeExpiredRetainedFiles(plan.retained, plan.cutoff); err != nil {
 		return err
 	}
-	if err := st.removeExpiredLiveRuns(plan.liveRuns); err != nil {
+	if err := st.removeExpiredLiveRuns(plan.liveRuns, plan.cutoff); err != nil {
 		return err
 	}
-	if err := st.evictToMaxSize(plan.blobs); err != nil {
+	evicted, err := st.evictToMaxSize(plan.blobs)
+	if err != nil {
 		return err
 	}
+	// The plan's orphan list was built before eviction, so an evicted output was
+	// still referenced then and its retained files were not candidates. Offer
+	// them now; removeOrphans re-queries the shard, so anything still referenced
+	// is kept.
+	st.addRetainedCandidates(plan.orphans, evicted)
 	if err := st.removeOrphans(plan.orphans); err != nil {
 		return err
 	}
@@ -575,36 +607,53 @@ func (st *store) planToMaxSize() ([]pruneCandidate, error) {
 	return st.pruneCandidates()
 }
 
-func (st *store) evictToMaxSize(candidates []pruneCandidate) error {
+// evictToMaxSize removes least-recently-used blobs until the cache is within
+// budget, and returns the outputs it evicted.
+func (st *store) evictToMaxSize(candidates []pruneCandidate) ([]string, error) {
 	if len(candidates) == 0 {
-		return nil
+		return nil, nil
 	}
 	// Re-read the size rather than trusting the planned total: a build that ran
 	// during the analysis may have freed or added blobs, and stopping at the
 	// real budget keeps this from over-evicting.
 	total, err := st.compressedSize()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	removed := 0
+	var evicted []string
 	for _, candidate := range candidates {
 		if total <= st.maxSize {
 			break
 		}
-		if err := os.Remove(st.blobPath(candidate.outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove compressed entry: %w", err)
+		// Candidates were chosen from the catalog as it was before this pass
+		// deleted expired entries, so some of them are already gone. Their bytes
+		// are not in the total that was just read, and crediting them anyway
+		// would end the loop early and leave the cache over budget — which is
+		// the whole point of eviction. The blobs are not leaked: an output with
+		// no surviving entries is in plan.orphans.
+		rows, err := st.q.deleteEntriesByOutputID(context.Background(), candidate.outputID)
+		if err != nil {
+			return nil, fmt.Errorf("delete pruned entries: %w", err)
 		}
-		if err := st.q.deleteEntriesByOutputID(context.Background(), candidate.outputID); err != nil {
-			return fmt.Errorf("delete pruned entries: %w", err)
+		if rows == 0 {
+			continue
+		}
+		if err := os.Remove(st.blobPath(candidate.outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("remove compressed entry: %w", err)
 		}
 		total -= candidate.size
-		removed++
+		evicted = append(evicted, candidate.outputID)
 	}
-	if st.verbose && removed > 0 {
-		log.Printf("gocachez: pruned %d blobs, compressed size now %s", removed, formatSize(total))
+	if st.verbose && len(evicted) > 0 {
+		log.Printf("gocachez: pruned %d blobs, compressed size now %s", len(evicted), formatSize(total))
 	}
-	return nil
+	return evicted, nil
 }
+
+// keepEveryEntry disables the access-time filter in referencedInShard. Zero
+// would not do: accessed_at can be negative if the clock was ever behind 1970,
+// and pruneDue already anticipates a skewed clock.
+const keepEveryEntry = math.MinInt64
 
 type pruneCandidate struct {
 	outputID string
@@ -668,6 +717,9 @@ func (st *store) planOldRetainedFiles(now time.Time) ([]string, error) {
 	var expired []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			// The walk runs without the lifecycle lock, so another process's
+			// scan can take a file or a shard from under it; the root may also
+			// never have existed.
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
 			}
@@ -694,11 +746,10 @@ func (st *store) planOldRetainedFiles(now time.Time) ([]string, error) {
 	return expired, nil
 }
 
-func (st *store) removeExpiredRetainedFiles(paths []string) error {
+func (st *store) removeExpiredRetainedFiles(paths []string, cutoff time.Time) error {
 	if len(paths) == 0 {
 		return nil
 	}
-	cutoff := trimCutoff(st.maxAge, time.Now())
 	removed := 0
 	for _, path := range paths {
 		// Re-read the mtime: a build that ran while this scan was planning may
@@ -753,11 +804,10 @@ func (st *store) planOldRetainedLiveDirs(now time.Time) ([]string, error) {
 	return expired, nil
 }
 
-func (st *store) removeExpiredLiveRuns(runDirs []string) error {
+func (st *store) removeExpiredLiveRuns(runDirs []string, cutoff time.Time) error {
 	if len(runDirs) == 0 {
 		return nil
 	}
-	cutoff := trimCutoff(st.maxAge, time.Now())
 	removed := 0
 	for _, runDir := range runDirs {
 		// Re-check under the lock: the run may have been reclaimed since, and a
@@ -885,9 +935,9 @@ func (st *store) removeOrphans(orphans map[int][]string) error {
 		// looked unreferenced during the unlocked scan may be referenced by now.
 		// Only shards with candidates are re-queried, which is why a healthy
 		// cache does no work here at all.
-		// The stale entries are gone by now, so an unfiltered query is both
-		// simpler and the honest check.
-		if err := st.referencedInShard(shard, 0, referenced); err != nil {
+		// pruneOldEntries has already run, so nothing is below the cutoff any
+		// more and an unfiltered query is both simpler and the honest check.
+		if err := st.referencedInShard(shard, keepEveryEntry, referenced); err != nil {
 			return err
 		}
 		for _, path := range orphans[shard] {
@@ -907,10 +957,27 @@ func shardPrefix(shard int) string {
 	return fmt.Sprintf("%02x", shard)
 }
 
+// addRetainedCandidates offers the retained files of outputs that this pass
+// deleted itself, which the plan could not have known about. Paths that do not
+// exist are harmless — removeOrphans tolerates a missing file — and the shard is
+// re-queried there, so anything still referenced is kept.
+func (st *store) addRetainedCandidates(orphans map[int][]string, outputIDs []string) {
+	for _, outputID := range outputIDs {
+		shard, err := strconv.ParseInt(outputID[:min(2, len(outputID))], 16, 32)
+		if err != nil {
+			// Not one of ours: retainedPath would file it under "xx".
+			continue
+		}
+		for _, ext := range []string{".a", ".go"} {
+			orphans[int(shard)] = append(orphans[int(shard)], st.retainedPath(outputID, ext))
+		}
+	}
+}
+
 // referencedInShard replaces outputIDs with the output IDs that the given
 // shard's entries reference. Entries accessed before minAccessedAt are ignored,
-// which lets a scan plan around the entries it is about to delete; pass 0 to
-// count every entry.
+// which lets a scan plan around the entries it is about to delete; pass
+// keepEveryEntry to count all of them.
 func (st *store) referencedInShard(shard int, minAccessedAt int64, outputIDs map[string]struct{}) error {
 	lower := shardPrefix(shard)
 	upper := shardPrefix(shard + 1)

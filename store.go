@@ -124,6 +124,13 @@ func pruneStampPath(versionDir string) string {
 	return filepath.Join(versionDir, "prune.stamp")
 }
 
+// maintenanceLockPath names the lock that admits one scanner at a time. It is
+// separate from the lifecycle lock so that serialising scans against each other
+// never makes a build wait to open the store.
+func maintenanceLockPath(versionDir string) string {
+	return filepath.Join(versionDir, "maintenance.lock")
+}
+
 func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPath string) (*store, error) {
 	if err := os.MkdirAll(blobsDir, 0o777); err != nil {
 		return nil, fmt.Errorf("create blobs dir: %w", err)

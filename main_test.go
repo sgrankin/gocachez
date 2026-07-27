@@ -778,7 +778,7 @@ func TestPruneRemovesOrphanRetainedFiles(t *testing.T) {
 	if _, err := os.Stat(exportPath); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.q.deleteEntriesByOutputID(context.Background(), hexOf(outputID)); err != nil {
+	if _, err := st.q.deleteEntriesByOutputID(context.Background(), hexOf(outputID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
@@ -1063,16 +1063,7 @@ func TestPruneSkipsScanWhileLifecycleLockIsHeld(t *testing.T) {
 
 	// Contended: prune must neither scan nor wait. Waiting is what would put
 	// another process's whole scan on this process's exit path.
-	done := make(chan error, 1)
-	go func() { done <- st.prune() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("prune waited for the lifecycle lock instead of skipping")
-	}
+	prunePromptly(t, st)
 	if _, err := os.Stat(blobPath); err != nil {
 		t.Fatalf("prune scanned without holding the lifecycle lock: %v", err)
 	}
@@ -1262,7 +1253,7 @@ func TestPruneSkipsScanWithinInterval(t *testing.T) {
 func TestPlanPruneDoesNotTakeTheLifecycleLock(t *testing.T) {
 	t.Parallel()
 
-	st, err := newStore(config{dir: t.TempDir()})
+	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge, maxSize: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1298,6 +1289,168 @@ func TestPlanPruneDoesNotTakeTheLifecycleLock(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("planPrune waited for the lifecycle lock")
+	}
+}
+
+// The default config sets both limits (20GiB, 5d), and eviction picks its
+// candidates from the catalog as it was before the age delete ran. Crediting a
+// candidate whose rows the age delete already removed ends the loop early and
+// leaves the cache over budget after a completed, stamped scan.
+func TestPruneEnforcesMaxSizeWhenMaxAgeAlsoFires(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir, maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	// Incompressible, so the stored size is predictable and the cache really
+	// does exceed the budget set below.
+	actions := make([][]byte, 0, 6)
+	for i := range 6 {
+		action := sha256.Sum256(fmt.Appendf(nil, "budget-action-%d", i))
+		output := sha256.Sum256(fmt.Appendf(nil, "budget-output-%d", i))
+		body := incompressibleBody(t, 4096, int64(i))
+		if _, err := st.put(request{
+			ID:       int64(i),
+			Command:  cmdPut,
+			ActionID: action[:],
+			OutputID: output[:],
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+		actions = append(actions, action[:])
+	}
+
+	// Age out half of them, so the age delete frees bytes that eviction's
+	// candidate list still believes it is responsible for.
+	stale := unixMillis(trimCutoff(defaultMaxAge, time.Now())) - int64(time.Minute/time.Millisecond)
+	for _, action := range actions[:3] {
+		if _, err := st.db.ExecContext(context.Background(),
+			`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, stale, hexOf(action)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Budget for roughly one surviving output, so eviction has to do real work
+	// after the age delete rather than coasting on bytes it did not free.
+	before, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.maxSize = before / 5
+	if before <= st.maxSize {
+		t.Fatalf("cache is %d bytes, not over the %d budget: nothing would be evicted", before, st.maxSize)
+	}
+
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	total, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total > st.maxSize {
+		t.Fatalf("cache is %d bytes after a completed scan, over its %d budget", total, st.maxSize)
+	}
+}
+
+func TestPruneSkipsScanWhileAnotherScanHoldsMaintenanceLock(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	blobPath := orphanBlob(t, st, strings.Repeat("c", 64))
+
+	// Another process is already analysing. Planning is expensive and its result
+	// would be discarded once that one stamps, so this scan should decline
+	// rather than duplicate it — and must not wait, since it is on an exit path.
+	lock := flock.New(maintenanceLockPath(st.versionDir))
+	if err := lock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close() //nolint:errcheck
+
+	prunePromptly(t, st)
+	if _, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("scan ran while another process held the maintenance lock: %v", err)
+	}
+
+	if err := lock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+	}
+}
+
+func TestPruneDoesNotCreateRunLockWhileCheckingLiveRuns(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	// A run dir mid-removal has no run.lock. Asking whether it is expired must
+	// not recreate one, or the removal's rmdir fails and the run comes back.
+	runDir := filepath.Join(st.liveRoot, "run-halfremoved")
+	if err := os.MkdirAll(runDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.planPrune(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "run.lock")); !os.IsNotExist(err) {
+		t.Fatalf("planning created run.lock: stat err = %v, want not exist", err)
+	}
+}
+
+func TestPlanPruneSkipsEntryDeleteWhenNothingIsStale(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	body := []byte("fresh")
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{97}, 32),
+		OutputID: bytes.Repeat([]byte{98}, 32),
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Everything was just written, so the age delete has nothing to match and
+	// the plan should not ask for it. MIN(accessed_at) answers that with a seek
+	// instead of the DELETE's scan.
+	plan, err := st.planPrune(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.entryCutoff != 0 {
+		t.Fatalf("entryCutoff = %d with no stale entries, want 0", plan.entryCutoff)
 	}
 }
 
@@ -1427,6 +1580,9 @@ func TestPruneKeepsRetainedFileRefreshedAfterPlanning(t *testing.T) {
 	if err := os.Chtimes(exportPath, fresh, fresh); err != nil {
 		t.Fatal(err)
 	}
+	// The first close already stamped; without this applyPrune declines and the
+	// file survives for the wrong reason.
+	expirePruneStamp(t, st.versionDir)
 	if err := st.applyPrune(plan); err != nil {
 		t.Fatal(err)
 	}
@@ -1510,10 +1666,10 @@ func TestPruneWithFreshStampDoesNotTouchTheLifecycleLock(t *testing.T) {
 
 	// A fresh stamp must short-circuit before the lock is attempted at all.
 	// Attempting it would report contention — and on an idle cache would take
-	// it, briefly blocking any build trying to open the store.
-	if err := st.prune(); err != nil {
-		t.Fatal(err)
-	}
+	// it, briefly blocking any build trying to open the store. Bounded, because
+	// a prune that blocked here would otherwise hang the whole test binary and
+	// swallow its siblings' failures.
+	prunePromptly(t, st)
 	if strings.Contains(logged.String(), "another process holds the cache lock") {
 		t.Fatalf("prune attempted the lifecycle lock with a fresh stamp: %q", logged.String())
 	}
@@ -1521,9 +1677,7 @@ func TestPruneWithFreshStampDoesNotTouchTheLifecycleLock(t *testing.T) {
 	// With the stamp stale it does attempt the lock, and reports the loss.
 	logged.Reset()
 	expirePruneStamp(t, st.versionDir)
-	if err := st.prune(); err != nil {
-		t.Fatal(err)
-	}
+	prunePromptly(t, st)
 	if !strings.Contains(logged.String(), "another process holds the cache lock") {
 		t.Fatalf("contended prune logged %q, want a skip notice", logged.String())
 	}
@@ -3930,6 +4084,34 @@ func readExportData(t *testing.T, path string) []byte {
 func retainedPath(cacheDir string, outputID []byte, ext string) string {
 	outputHex := hexOf(outputID)
 	return filepath.Join(cacheDir, "v1", retainedDirName, outputHex[:2], outputHex+ext)
+}
+
+// incompressibleBody returns bytes zstd cannot shrink, so a test can reason
+// about the cache's stored size.
+func incompressibleBody(t *testing.T, size int, seed int64) []byte {
+	t.Helper()
+	body := make([]byte, 0, size)
+	for i := 0; len(body) < size; i++ {
+		sum := sha256.Sum256(fmt.Appendf(nil, "incompressible-%d-%d", seed, i))
+		body = append(body, sum[:]...)
+	}
+	return body[:size]
+}
+
+// prunePromptly runs prune and fails if it blocks, rather than deadlocking the
+// test binary when something is holding a lock it should have declined.
+func prunePromptly(t *testing.T, st *store) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- st.prune() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("prune blocked instead of skipping")
+	}
 }
 
 // expirePruneStamp backdates the maintenance stamp, standing in for the
