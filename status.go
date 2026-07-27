@@ -20,6 +20,7 @@ type cacheStatus struct {
 	cacheDir         string
 	maxSize          int64
 	maxAge           time.Duration
+	maxRetainedAge   time.Duration
 	verbose          bool
 	versionDir       string
 	catalogExists    bool
@@ -75,6 +76,7 @@ func writeStatus(cfg config, w io.Writer) error {
 		{"Version directory", status.versionDir},
 		{"Max size", formatBytes(status.maxSize)},
 		{"Max age", formatMaxAge(status.maxAge)},
+		{"Max retained age", formatMaxAge(status.maxRetainedAge)},
 		{"Verbose", strconv.FormatBool(status.verbose)},
 	}); err != nil {
 		return err
@@ -126,11 +128,12 @@ func readStatus(cfg config) (cacheStatus, error) {
 	// it reports whatever survived to be read.
 	versionDir, blobsDir, liveRoot, _ := cachePaths(cfg)
 	status := cacheStatus{
-		cacheDir:   cfg.dir,
-		maxSize:    cfg.maxSize,
-		maxAge:     cfg.maxAge,
-		verbose:    cfg.verbose,
-		versionDir: versionDir,
+		cacheDir:       cfg.dir,
+		maxSize:        cfg.maxSize,
+		maxAge:         cfg.maxAge,
+		maxRetainedAge: cfg.retainedAge(),
+		verbose:        cfg.verbose,
+		versionDir:     versionDir,
 	}
 	if _, err := os.Stat(versionDir); errors.Is(err, os.ErrNotExist) {
 		return status, nil

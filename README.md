@@ -176,6 +176,30 @@ status` for what is actually on disk.
 - Default: `5d`, matching `cmd/go`'s `GOCACHE`; `0` disables age-based pruning.
   Accepts a duration such as `5d`, `36h`, or `90m`.
 
+**Maximum age of unused retained files**
+
+- Config: `maxRetainedAge`
+- Environment: `GOCACHEZ_MAX_RETAINED_AGE`
+- Flag: `-max-retained-age`
+- Default: whatever `maxAge` is. Unlike `maxAge`, `0` means "follow `maxAge`"
+  rather than "disabled".
+
+Retained files are not cache entries — they exist only so that paths which
+escaped a finished build stay openable (see above). Losing one costs a re-strip
+the next time its output is used, whereas losing a blob costs a rebuild, so they
+are usually worth expiring far sooner than the cache itself. On a cache with high
+key churn every rebuild of a package mints another one, and by default they all
+linger for `maxAge`; that tail can rival the blobs in size.
+
+Set this to roughly how long a tool might hold a path from `go list` after the
+build that produced it finished. For CI, that is the length of a job. Locally it
+is the length of an editor session, because `go/packages` consumers such as
+`gopls` and `golangci-lint` can hold an `Export` path for as long as they run —
+which is why the default leaves the previous behaviour alone. A file still in use
+is safe: its mtime is refreshed as builds touch it, and the cutoff allows a
+further `mtimeInterval` (1h) of slack on top of the configured age, so `1h`
+expires at about two.
+
 Age-based pruning is independent of `maxSize`: entries and retained files that
 have not been used within `maxAge` are trimmed even while the cache is under its
 size limit.

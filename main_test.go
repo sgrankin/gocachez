@@ -1457,6 +1457,186 @@ func TestPlanPruneSkipsEntryDeleteWhenNothingIsStale(t *testing.T) {
 // A size-evicted output's retained export has to go with it. The orphan list is
 // built before eviction runs, so the output was still referenced then and its
 // retained files were not candidates — eviction has to offer them afterwards.
+// retainedPaths is where one retained go-list file lives: the durable copy under
+// retained/, and the hard link in a live run dir that is the path a tool
+// actually opened.
+type retainedPaths struct {
+	export string
+	live   string
+	runDir string
+}
+
+// retainedCache puts a package archive and closes, which is what turns a live
+// file into a retained export archive plus a hard link in the live run dir.
+func retainedCache(t *testing.T, cfg config, outputID []byte) retainedPaths {
+	t.Helper()
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 64))
+	res, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{120}, 32),
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	paths := retainedPaths{
+		export: retainedPath(cfg.dir, outputID, ".a"),
+		live:   res.DiskPath,
+		runDir: filepath.Dir(res.DiskPath),
+	}
+	if _, err := os.Stat(paths.export); err != nil {
+		t.Fatalf("no retained export was produced: %v", err)
+	}
+	if _, err := os.Stat(paths.live); err != nil {
+		t.Fatalf("no escaped live path survived close: %v", err)
+	}
+	return paths
+}
+
+func TestRetainedFilesExpireOnTheirOwnAge(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	cfg := config{dir: cacheDir, maxAge: defaultMaxAge, maxRetainedAge: time.Hour}
+	outputID := bytes.Repeat([]byte{121}, 32)
+	paths := retainedCache(t, cfg, outputID)
+
+	// Older than the retained age but far younger than maxAge, so only the
+	// separate setting can reclaim it. The live run dir carries the escaped
+	// path's hard link, so it has to go too or the inode survives.
+	old := trimCutoff(time.Hour, time.Now()).Add(-time.Minute)
+	for _, path := range []string{paths.export, filepath.Join(paths.runDir, "run.lock")} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	expirePruneStamp(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(paths.export); !os.IsNotExist(err) {
+		t.Fatalf("retained export stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(paths.live); !os.IsNotExist(err) {
+		t.Fatalf("escaped live path stat err = %v, want not exist", err)
+	}
+	// The blob is the cache entry and is nowhere near maxAge: losing a retained
+	// file costs a re-strip, losing this would cost a rebuild.
+	if _, err := os.Stat(st.blobPath(hexOf(outputID))); err != nil {
+		t.Fatalf("blob was pruned along with its retained file: %v", err)
+	}
+}
+
+func TestRetainedFilesFollowMaxAgeByDefault(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	// maxRetainedAge unset: the previous behaviour, so a long editor session
+	// holding an escaped path is unaffected until someone opts in.
+	cfg := config{dir: cacheDir, maxAge: defaultMaxAge}
+	paths := retainedCache(t, cfg, bytes.Repeat([]byte{122}, 32))
+
+	old := trimCutoff(time.Hour, time.Now()).Add(-time.Minute)
+	for _, path := range []string{paths.export, filepath.Join(paths.runDir, "run.lock")} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	expirePruneStamp(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(paths.export); err != nil {
+		t.Fatalf("retained export expired at an hour without being asked to: %v", err)
+	}
+	if _, err := os.Stat(paths.live); err != nil {
+		t.Fatalf("escaped live path expired at an hour without being asked to: %v", err)
+	}
+}
+
+func TestRetainedFileIsRecreatedAfterExpiring(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	cfg := config{dir: cacheDir, maxAge: defaultMaxAge, maxRetainedAge: time.Hour}
+	outputID := bytes.Repeat([]byte{123}, 32)
+	paths := retainedCache(t, cfg, outputID)
+
+	old := trimCutoff(time.Hour, time.Now()).Add(-time.Minute)
+	for _, path := range []string{paths.export, filepath.Join(paths.runDir, "run.lock")} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	expirePruneStamp(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+	if _, err := os.Stat(paths.export); !os.IsNotExist(err) {
+		t.Fatalf("retained export stat err = %v, want not exist", err)
+	}
+
+	// Expiring one is cheap precisely because using the output again rebuilds it:
+	// the get materializes a live file and close re-strips it. That is what makes
+	// a short retained age safe where a short maxAge would not be.
+	st, err = newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.get(request{
+		ID:       1,
+		Command:  cmdGet,
+		ActionID: bytes.Repeat([]byte{120}, 32),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Miss {
+		t.Fatal("get missed: the blob should have outlived its retained file")
+	}
+	st.close()
+
+	if _, err := os.Stat(paths.export); err != nil {
+		t.Fatalf("retained export was not recreated by using the output: %v", err)
+	}
+}
+
 func TestPruneRemovesRetainedFilesOfEvictedOutputs(t *testing.T) {
 	t.Parallel()
 
@@ -3949,6 +4129,42 @@ func TestParseFlagsUsesEnvironmentOverrides(t *testing.T) {
 	}
 	if !cfg.verbose {
 		t.Fatal("verbose = false, want true")
+	}
+}
+
+func TestParseFlagsResolvesMaxRetainedAge(t *testing.T) {
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.json")
+	configJSON := `{"maxAge": "10d", "maxRetainedAge": "4h"}`
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  string
+		want time.Duration
+	}{
+		{name: "config file", args: []string{"-config", configPath}, want: 4 * time.Hour},
+		{name: "env overrides config", args: []string{"-config", configPath}, env: "90m", want: 90 * time.Minute},
+		{name: "flag overrides env", args: []string{"-config", configPath, "-max-retained-age", "30m"}, env: "90m", want: 30 * time.Minute},
+		// Unset, and explicit zero, both mean "follow maxAge" — the zero value of
+		// a config must not silently switch retained pruning off.
+		{name: "unset follows maxAge", args: []string{"-max-age", "3d"}, want: 3 * 24 * time.Hour},
+		{name: "zero follows maxAge", args: []string{"-max-age", "3d", "-max-retained-age", "0"}, want: 3 * 24 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GOCACHEZ_MAX_RETAINED_AGE", tc.env)
+			t.Setenv("GOCACHEZ_CONFIG", "")
+			cfg, err := parseFlags(tc.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.retainedAge(); got != tc.want {
+				t.Fatalf("retainedAge = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -498,15 +498,15 @@ func (st *store) markPruned() error {
 //     matter — a put writes its blob before inserting the row, so a blob can be
 //     unreferenced during the walk and referenced by the time we delete.
 type prunePlan struct {
-	// cutoff is the age boundary the plan was built against. Deletion re-reads
-	// mtimes but compares them to this, so the re-check can only ever keep more
-	// than the plan chose, never less.
-	cutoff      time.Time
-	entryCutoff int64            // delete entries unused since this; 0 for none
-	retained    []string         // expired retained files
-	liveRuns    []string         // expired retained live run dirs
-	blobs       []pruneCandidate // over-budget blobs, least recently used first
-	orphans     map[int][]string // shard index -> files with no catalog entry
+	// retainedCutoff is the age boundary the retained groups were built against.
+	// Deletion re-reads mtimes but compares them to this, so the re-check can
+	// only ever keep more than the plan chose, never less.
+	retainedCutoff time.Time
+	entryCutoff    int64            // delete entries unused since this; 0 for none
+	retained       []string         // expired retained files
+	liveRuns       []string         // expired retained live run dirs
+	blobs          []pruneCandidate // over-budget blobs, least recently used first
+	orphans        map[int][]string // shard index -> files with no catalog entry
 }
 
 func (p prunePlan) empty() bool {
@@ -518,7 +518,7 @@ func (p prunePlan) empty() bool {
 }
 
 func (st *store) planPrune(now time.Time) (prunePlan, error) {
-	plan := prunePlan{cutoff: trimCutoff(st.maxAge, now)}
+	plan := prunePlan{retainedCutoff: trimCutoff(st.retainedAge(), now)}
 	var err error
 	if plan.entryCutoff, err = st.planOldEntries(now); err != nil {
 		return prunePlan{}, err
@@ -578,10 +578,10 @@ func (st *store) deletePlanned(plan prunePlan) error {
 	if err := st.pruneOldEntries(plan.entryCutoff); err != nil {
 		return err
 	}
-	if err := st.removeExpiredRetainedFiles(plan.retained, plan.cutoff); err != nil {
+	if err := st.removeExpiredRetainedFiles(plan.retained, plan.retainedCutoff); err != nil {
 		return err
 	}
-	if err := st.removeExpiredLiveRuns(plan.liveRuns, plan.cutoff); err != nil {
+	if err := st.removeExpiredLiveRuns(plan.liveRuns, plan.retainedCutoff); err != nil {
 		return err
 	}
 	evicted, err := st.evictToMaxSize(plan.blobs)
@@ -750,11 +750,11 @@ func (st *store) pruneOldEntries(cutoff int64) error {
 }
 
 func (st *store) planOldRetainedFiles(now time.Time) ([]string, error) {
-	if st.maxAge <= 0 {
+	if st.retainedAge() <= 0 {
 		return nil, nil
 	}
 	root := retainedRoot(st.versionDir)
-	cutoff := trimCutoff(st.maxAge, now)
+	cutoff := trimCutoff(st.retainedAge(), now)
 	var expired []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -811,13 +811,17 @@ func (st *store) removeExpiredRetainedFiles(paths []string, cutoff time.Time) er
 		removed++
 	}
 	if st.verbose && removed > 0 {
-		log.Printf("gocachez: pruned %d old retained files", removed)
+		log.Printf("gocachez: pruned %d retained files not used in %s", removed, st.retainedAge())
 	}
 	return nil
 }
 
+// planOldRetainedLiveDirs lists live run dirs old enough to remove. These matter
+// as much as the retained/ copies: the path a tool actually opened is the live
+// one, hard-linked to the retained file, so the inode outlives an expired
+// retained/ entry but not an expired live dir.
 func (st *store) planOldRetainedLiveDirs(now time.Time) ([]string, error) {
-	if st.maxAge <= 0 {
+	if st.retainedAge() <= 0 {
 		return nil, nil
 	}
 	entries, err := os.ReadDir(st.liveRoot)
@@ -827,7 +831,7 @@ func (st *store) planOldRetainedLiveDirs(now time.Time) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read live dir: %w", err)
 	}
-	cutoff := trimCutoff(st.maxAge, now)
+	cutoff := trimCutoff(st.retainedAge(), now)
 	var expired []string
 	for _, entry := range entries {
 		if !entry.IsDir() {

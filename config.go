@@ -17,19 +17,41 @@ import (
 const defaultMaxAge = 5 * 24 * time.Hour
 
 type config struct {
-	dir        string
-	maxSize    int64
-	maxAge     time.Duration
-	verbose    bool
-	cpuProfile string
-	memProfile string
+	dir     string
+	maxSize int64
+	maxAge  time.Duration
+	// maxRetainedAge expires retained go-list files, which exist only so paths
+	// that escaped a finished build stay openable. Unlike a blob, losing one
+	// costs nothing but a re-strip on the next use, so it is usually worth
+	// expiring them far sooner than the cache proper. Read it through
+	// retainedAge, not directly.
+	maxRetainedAge time.Duration
+	verbose        bool
+	cpuProfile     string
+	memProfile     string
+}
+
+// retainedAge reports when retained files expire: maxRetainedAge if it was set,
+// otherwise maxAge, which is how gocachez behaved before the setting existed.
+//
+// Zero means "follow maxAge" here rather than "disabled" as it does for maxAge.
+// The zero value of a config has to be the safe one — silently switching
+// retained pruning off would leave escaped-path files accumulating until their
+// cache entry went — and there is no use for keeping them longer than the
+// entries that reference them anyway.
+func (c config) retainedAge() time.Duration {
+	if c.maxRetainedAge > 0 {
+		return c.maxRetainedAge
+	}
+	return c.maxAge
 }
 
 type fileConfig struct {
-	CacheDir *string `json:"cacheDir"`
-	MaxSize  *string `json:"maxSize"`
-	MaxAge   *string `json:"maxAge"`
-	Verbose  *bool   `json:"verbose"`
+	CacheDir       *string `json:"cacheDir"`
+	MaxSize        *string `json:"maxSize"`
+	MaxAge         *string `json:"maxAge"`
+	MaxRetainedAge *string `json:"maxRetainedAge"`
+	Verbose        *bool   `json:"verbose"`
 }
 
 func parseFlags(args []string) (config, error) {
@@ -58,7 +80,7 @@ func parseFlagOperands(args []string) (config, []string, error) {
 	}
 	configPath, configRequired := defaultConfigPath()
 
-	var flagDir, flagMaxSize, flagMaxAge string
+	var flagDir, flagMaxSize, flagMaxAge, flagMaxRetainedAge string
 	var flagVerbose bool
 
 	fs := flag.NewFlagSet("gocachez", flag.ContinueOnError)
@@ -67,6 +89,7 @@ func parseFlagOperands(args []string) (config, []string, error) {
 	fs.StringVar(&flagDir, "dir", "", "cache directory")
 	fs.StringVar(&flagMaxSize, "max-size", "", "maximum compressed cache size, or 0 to disable pruning")
 	fs.StringVar(&flagMaxAge, "max-age", "", "maximum age of unused entries, or 0 to disable age-based pruning")
+	fs.StringVar(&flagMaxRetainedAge, "max-retained-age", "", "maximum age of unused retained go-list files; 0 or unset follows -max-age")
 	fs.BoolVar(&flagVerbose, "v", false, "log cache maintenance to stderr")
 	fs.StringVar(&cfg.cpuProfile, "cpuprofile", "", "write CPU profile to file")
 	fs.StringVar(&cfg.memProfile, "memprofile", "", "write memory profile to file")
@@ -100,6 +123,11 @@ func parseFlagOperands(args []string) (config, []string, error) {
 			return config{}, nil, fmt.Errorf("parse GOCACHEZ_MAX_AGE: %w", err)
 		}
 	}
+	if value := os.Getenv("GOCACHEZ_MAX_RETAINED_AGE"); value != "" {
+		if cfg.maxRetainedAge, err = parseAge(value); err != nil {
+			return config{}, nil, fmt.Errorf("parse GOCACHEZ_MAX_RETAINED_AGE: %w", err)
+		}
+	}
 	if value := os.Getenv("GOCACHEZ_VERBOSE"); value != "" {
 		if cfg.verbose, err = strconv.ParseBool(value); err != nil {
 			return config{}, nil, fmt.Errorf("parse GOCACHEZ_VERBOSE: %w", err)
@@ -117,6 +145,11 @@ func parseFlagOperands(args []string) (config, []string, error) {
 	if visited["max-age"] {
 		if cfg.maxAge, err = parseAge(flagMaxAge); err != nil {
 			return config{}, nil, fmt.Errorf("parse -max-age: %w", err)
+		}
+	}
+	if visited["max-retained-age"] {
+		if cfg.maxRetainedAge, err = parseAge(flagMaxRetainedAge); err != nil {
+			return config{}, nil, fmt.Errorf("parse -max-retained-age: %w", err)
 		}
 	}
 	if visited["v"] {
@@ -191,6 +224,13 @@ func applyFileConfig(cfg *config, fc fileConfig) error {
 			return fmt.Errorf("parse config maxAge: %w", err)
 		}
 		cfg.maxAge = maxAge
+	}
+	if fc.MaxRetainedAge != nil {
+		maxRetainedAge, err := parseAge(*fc.MaxRetainedAge)
+		if err != nil {
+			return fmt.Errorf("parse config maxRetainedAge: %w", err)
+		}
+		cfg.maxRetainedAge = maxRetainedAge
 	}
 	if fc.Verbose != nil {
 		cfg.verbose = *fc.Verbose
