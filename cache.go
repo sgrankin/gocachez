@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -39,7 +40,7 @@ const (
 	//
 	// The interval is a lower bound on the gap between scans, not an upper
 	// bound: a scan also requires the cache to be momentarily idle (see
-	// pruneLocked), so a machine that always has a build running defers it.
+	// applyPrune), so a machine that always has a build running defers it.
 	pruneInterval = time.Hour
 
 	// pruneOvershootDivisor caps how far a *single* run can push the cache past
@@ -389,25 +390,40 @@ func (st *store) deleteOutput(outputID string) error {
 	return nil
 }
 
+// prune runs the maintenance scan when one is due.
+//
+// Deciding what to remove is the expensive part — it walks the retained tree,
+// aggregates the catalog, and reconciles all 256 blob shards against it — and
+// it runs without the lifecycle lock. newStore takes that lock, so holding it
+// across the analysis is what stalled a starting build for the length of a
+// whole scan. Only the deletions take it.
+//
+// What the lock guarantees is unchanged: nothing is removed unless the cache is
+// idle. put and get never take it, so "no run is registered" is what makes
+// removal safe, and applyPrune re-confirms that under the lock. Because the
+// analysis ran unlocked, applyPrune also re-verifies what it is about to
+// delete — see prunePlan.
 func (st *store) prune() error {
-	// Check the stamp before taking the lock. Skipping is the common case, and
-	// the lock may be held by another process's scan; blocking on it here would
-	// stall this process's exit for exactly as long as the scan we are about to
-	// decline to repeat.
+	// Check the stamp before anything else: skipping is the common case.
 	if !st.pruneDue(time.Now()) {
 		return nil
 	}
-	// Skip rather than queue when the stamp is genuinely stale but someone else
-	// holds the lock. Whoever holds it is either running this same scan or
-	// opening a store — meaning the cache is in use and pruneLocked would
-	// decline anyway. Waiting would put the whole scan on this process's exit,
-	// which the go command waits for. The stamp stays stale, so the next exit
-	// retries.
-	scanned, err := withFileLockIfFree(st.lifecycleLockPath, st.pruneLocked)
-	if !scanned && err == nil && st.verbose {
-		log.Print("gocachez: skipped maintenance, another process holds the cache lock")
+	// Analysing a cache that other builds are still using is wasted work, and
+	// applyPrune would decline to delete anyway. Purely an optimisation — the
+	// authoritative check happens under the lock.
+	active, err := st.q.countRuns(context.Background())
+	if err != nil {
+		return fmt.Errorf("count active runs: %w", err)
 	}
-	return err
+	if active > 0 {
+		return nil
+	}
+
+	plan, err := st.planPrune(time.Now())
+	if err != nil {
+		return err
+	}
+	return st.applyPrune(plan)
 }
 
 // pruneDue reports whether the maintenance scan should run. A stamp dated in
@@ -433,56 +449,140 @@ func (st *store) markPruned() error {
 	return nil
 }
 
-func (st *store) pruneLocked() error {
-	if err := st.cleanupAbandonedRuns(); err != nil && st.verbose {
-		log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
-	}
-	activeRuns, err := st.q.countRuns(context.Background())
-	if err != nil {
-		return fmt.Errorf("count active runs: %w", err)
-	}
-	if activeRuns > 0 {
-		return nil
-	}
-	// Another process may have finished a scan while we waited for the lock.
-	if !st.pruneDue(time.Now()) {
-		return nil
-	}
-	if err := st.pruneScan(); err != nil {
-		return err
-	}
-	return st.markPruned()
+// prunePlan is what a scan decided to remove. It is computed without the
+// lifecycle lock, so a build can have started, written, and finished while it
+// was being built. applyPrune therefore re-verifies each group under the lock
+// rather than trusting the plan:
+//
+//   - entries: the DELETE re-evaluates accessed_at, so an entry a build touched
+//     no longer matches.
+//   - retained files and live runs: their mtimes are re-read, so anything a
+//     build refreshed is kept.
+//   - blobs: the cache size is re-read, so eviction stops as soon as the cache
+//     is back under budget.
+//   - orphans: the shards holding candidates are re-queried, so a file that has
+//     since gained a catalog entry is kept. This is the one that would otherwise
+//     matter — a put writes its blob before inserting the row, so a blob can be
+//     unreferenced during the walk and referenced by the time we delete.
+type prunePlan struct {
+	entryCutoff int64            // delete entries unused since this; 0 for none
+	retained    []string         // expired retained files
+	liveRuns    []string         // expired retained live run dirs
+	blobs       []pruneCandidate // over-budget blobs, least recently used first
+	orphans     map[int][]string // shard index -> files with no catalog entry
 }
 
-func (st *store) pruneScan() error {
-	if err := st.pruneOldRetainedFiles(time.Now()); err != nil {
-		return err
-	}
-	if err := st.pruneOldRetainedLiveDirs(time.Now()); err != nil {
-		return err
-	}
-	if err := st.pruneOldEntries(time.Now()); err != nil {
-		return err
-	}
-	if err := st.pruneToMaxSize(); err != nil {
-		return err
-	}
-	return st.removeOrphanOutputFiles(true)
+func (p prunePlan) empty() bool {
+	return p.entryCutoff == 0 &&
+		len(p.retained) == 0 &&
+		len(p.liveRuns) == 0 &&
+		len(p.blobs) == 0 &&
+		len(p.orphans) == 0
 }
 
-func (st *store) pruneToMaxSize() error {
+func (st *store) planPrune(now time.Time) (prunePlan, error) {
+	var plan prunePlan
+	var err error
+	if plan.entryCutoff, err = st.planOldEntries(now); err != nil {
+		return prunePlan{}, err
+	}
+	if plan.retained, err = st.planOldRetainedFiles(now); err != nil {
+		return prunePlan{}, err
+	}
+	if plan.liveRuns, err = st.planOldRetainedLiveDirs(now); err != nil {
+		return prunePlan{}, err
+	}
+	if plan.blobs, err = st.planToMaxSize(); err != nil {
+		return prunePlan{}, err
+	}
+	// Entries this scan is about to delete must not count as references, or the
+	// blobs they were the last holder of would survive until the next scan.
+	if plan.orphans, err = st.planOrphans(true, plan.entryCutoff); err != nil {
+		return prunePlan{}, err
+	}
+	return plan, nil
+}
+
+// applyPrune performs the plan's deletions under the lifecycle lock, or does
+// nothing if the cache turned out to be in use or another process got there
+// first. The stamp is only written when a scan actually completed, so a declined
+// attempt is retried by the next process to exit past the interval.
+func (st *store) applyPrune(plan prunePlan) error {
+	applied, err := withFileLockIfFree(st.lifecycleLockPath, func() error {
+		if err := st.cleanupAbandonedRuns(); err != nil && st.verbose {
+			log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
+		}
+		active, err := st.q.countRuns(context.Background())
+		if err != nil {
+			return fmt.Errorf("count active runs: %w", err)
+		}
+		if active > 0 {
+			return nil
+		}
+		// Another process may have finished a scan while this one was planning.
+		if !st.pruneDue(time.Now()) {
+			return nil
+		}
+		if err := st.deletePlanned(plan); err != nil {
+			return err
+		}
+		return st.markPruned()
+	})
+	if err == nil && !applied && st.verbose {
+		log.Print("gocachez: skipped maintenance, another process holds the cache lock")
+	}
+	return err
+}
+
+func (st *store) deletePlanned(plan prunePlan) error {
+	if plan.empty() {
+		return nil
+	}
+	if err := st.pruneOldEntries(plan.entryCutoff); err != nil {
+		return err
+	}
+	if err := st.removeExpiredRetainedFiles(plan.retained); err != nil {
+		return err
+	}
+	if err := st.removeExpiredLiveRuns(plan.liveRuns); err != nil {
+		return err
+	}
+	if err := st.evictToMaxSize(plan.blobs); err != nil {
+		return err
+	}
+	if err := st.removeOrphans(plan.orphans); err != nil {
+		return err
+	}
+	if err := removeEmptyDirs(st.blobsDir); err != nil {
+		return err
+	}
+	return removeEmptyDirs(retainedRoot(st.versionDir))
+}
+
+// planToMaxSize lists blobs to evict, least recently used first, or nothing if
+// the cache is within budget.
+func (st *store) planToMaxSize() ([]pruneCandidate, error) {
 	if st.maxSize <= 0 {
-		return nil
+		return nil, nil
 	}
 	total, err := st.compressedSize()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if total <= st.maxSize {
+		return nil, nil
+	}
+	return st.pruneCandidates()
+}
+
+func (st *store) evictToMaxSize(candidates []pruneCandidate) error {
+	if len(candidates) == 0 {
 		return nil
 	}
-
-	candidates, err := st.pruneCandidates()
+	// Re-read the size rather than trusting the planned total: a build that ran
+	// during the analysis may have freed or added blobs, and stopping at the
+	// real budget keeps this from over-evicting.
+	total, err := st.compressedSize()
 	if err != nil {
 		return err
 	}
@@ -527,11 +627,28 @@ func (st *store) pruneCandidates() ([]pruneCandidate, error) {
 	return candidates, nil
 }
 
-func (st *store) pruneOldEntries(now time.Time) error {
+// planOldEntries returns the cutoff to delete by, or 0 when no entry is old
+// enough to be worth taking the lock for. MIN(accessed_at) is index-backed, so
+// answering that costs one seek rather than the DELETE's scan.
+func (st *store) planOldEntries(now time.Time) (int64, error) {
 	if st.maxAge <= 0 {
-		return nil
+		return 0, nil
 	}
 	cutoff := unixMillis(trimCutoff(st.maxAge, now))
+	oldest, ok, err := st.q.oldestAccess(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("find oldest entry access: %w", err)
+	}
+	if !ok || oldest >= cutoff {
+		return 0, nil
+	}
+	return cutoff, nil
+}
+
+func (st *store) pruneOldEntries(cutoff int64) error {
+	if cutoff == 0 {
+		return nil
+	}
 	removed, err := st.q.deleteEntriesAccessedBefore(context.Background(), cutoff)
 	if err != nil {
 		return fmt.Errorf("prune old entries: %w", err)
@@ -542,20 +659,18 @@ func (st *store) pruneOldEntries(now time.Time) error {
 	return nil
 }
 
-func (st *store) pruneOldRetainedFiles(now time.Time) error {
+func (st *store) planOldRetainedFiles(now time.Time) ([]string, error) {
 	if st.maxAge <= 0 {
-		return nil
+		return nil, nil
 	}
 	root := retainedRoot(st.versionDir)
-	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("stat retained root: %w", err)
-	}
 	cutoff := trimCutoff(st.maxAge, now)
-	removed := 0
+	var expired []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		if d.IsDir() || (!strings.HasSuffix(path, ".a") && !strings.HasSuffix(path, ".go")) {
@@ -563,76 +678,138 @@ func (st *store) pruneOldRetainedFiles(now time.Time) error {
 		}
 		info, err := d.Info()
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
 			return fmt.Errorf("stat retained file: %w", err)
 		}
 		if info.ModTime().Before(cutoff) {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("remove old retained file: %w", err)
-			}
-			removed++
+			expired = append(expired, path)
 		}
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
+	}
+	return expired, nil
+}
+
+func (st *store) removeExpiredRetainedFiles(paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	cutoff := trimCutoff(st.maxAge, time.Now())
+	removed := 0
+	for _, path := range paths {
+		// Re-read the mtime: a build that ran while this scan was planning may
+		// have used the file, and markRetainedFileUsed would have refreshed it.
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("stat retained file: %w", err)
+		}
+		if !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove old retained file: %w", err)
+		}
+		removed++
 	}
 	if st.verbose && removed > 0 {
 		log.Printf("gocachez: pruned %d old retained files", removed)
 	}
-	return removeEmptyDirs(root)
+	return nil
 }
 
-func (st *store) pruneOldRetainedLiveDirs(now time.Time) error {
+func (st *store) planOldRetainedLiveDirs(now time.Time) ([]string, error) {
 	if st.maxAge <= 0 {
-		return nil
+		return nil, nil
 	}
 	entries, err := os.ReadDir(st.liveRoot)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return fmt.Errorf("read live dir: %w", err)
+		return nil, fmt.Errorf("read live dir: %w", err)
 	}
 	cutoff := trimCutoff(st.maxAge, now)
-	removed := 0
+	var expired []string
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		runDir := filepath.Join(st.liveRoot, entry.Name())
-		runLock := flock.New(filepath.Join(runDir, "run.lock"))
-		locked, err := runLock.TryLock()
+		isExpired, err := liveRunExpiredIfUnlocked(runDir, cutoff)
 		if err != nil {
-			_ = runLock.Close()
-			return fmt.Errorf("try lock retained live run %s: %w", entry.Name(), err)
+			return nil, err
 		}
-		if !locked {
-			_ = runLock.Close()
+		if isExpired {
+			expired = append(expired, runDir)
+		}
+	}
+	return expired, nil
+}
+
+func (st *store) removeExpiredLiveRuns(runDirs []string) error {
+	if len(runDirs) == 0 {
+		return nil
+	}
+	cutoff := trimCutoff(st.maxAge, time.Now())
+	removed := 0
+	for _, runDir := range runDirs {
+		// Re-check under the lock: the run may have been reclaimed since, and a
+		// dir is only ever removed while nothing holds its lock.
+		expired, err := liveRunExpiredIfUnlocked(runDir, cutoff)
+		if err != nil {
+			return err
+		}
+		if !expired {
 			continue
 		}
-		expired, expireErr := retainedLiveRunExpired(runDir, cutoff)
-		unlockErr := runLock.Unlock()
-		closeErr := runLock.Close()
-		if expireErr != nil {
-			return expireErr
+		if err := os.RemoveAll(runDir); err != nil {
+			return fmt.Errorf("remove old retained live run: %w", err)
 		}
-		if unlockErr != nil {
-			return fmt.Errorf("unlock retained live run: %w", unlockErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close retained live run lock: %w", closeErr)
-		}
-		if expired {
-			if err := os.RemoveAll(runDir); err != nil {
-				return fmt.Errorf("remove old retained live run: %w", err)
-			}
-			removed++
-		}
+		removed++
 	}
 	if st.verbose && removed > 0 {
 		log.Printf("gocachez: pruned %d old retained live runs", removed)
 	}
 	return nil
+}
+
+// liveRunExpiredIfUnlocked reports whether a live run is both idle and older
+// than the cutoff. The lock is opened without O_CREATE so that merely asking
+// cannot resurrect a run dir that is midway through being removed.
+func liveRunExpiredIfUnlocked(runDir string, cutoff time.Time) (bool, error) {
+	runLock := flock.New(filepath.Join(runDir, "run.lock"), flock.SetFlag(os.O_RDONLY))
+	locked, err := runLock.TryLock()
+	if err != nil {
+		_ = runLock.Close()
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("try lock retained live run %s: %w", filepath.Base(runDir), err)
+	}
+	if !locked {
+		_ = runLock.Close()
+		return false, nil
+	}
+	expired, expireErr := retainedLiveRunExpired(runDir, cutoff)
+	unlockErr := runLock.Unlock()
+	closeErr := runLock.Close()
+	if expireErr != nil {
+		return false, expireErr
+	}
+	if unlockErr != nil {
+		return false, fmt.Errorf("unlock retained live run: %w", unlockErr)
+	}
+	if closeErr != nil {
+		return false, fmt.Errorf("close retained live run lock: %w", closeErr)
+	}
+	return expired, nil
 }
 
 func retainedLiveRunExpired(runDir string, cutoff time.Time) (bool, error) {
@@ -665,37 +842,90 @@ func markRetainedFileUsed(path string) error {
 	return os.Chtimes(path, now, now)
 }
 
-func (st *store) removeOrphanOutputFiles(includeBlobs bool) error {
-	// Output files are already partitioned by the first byte of their hex ID.
-	// Reconcile one shard at a time to keep memory bounded without per-file SQL.
+// planOrphans lists output files with no catalog entry, keyed by shard so
+// removeOrphans can re-check just the shards that turned something up.
+//
+// Output files are partitioned by the first byte of their hex ID, so one shard
+// at a time keeps memory bounded without per-file SQL.
+func (st *store) planOrphans(includeBlobs bool, entryCutoff int64) (map[int][]string, error) {
 	referenced := make(map[string]struct{})
+	orphans := make(map[int][]string)
 	for shard := range 256 {
-		lower := fmt.Sprintf("%02x", shard)
-		upper := fmt.Sprintf("%02x", shard+1)
-		if shard == 255 {
-			upper = "g"
+		if err := st.referencedInShard(shard, entryCutoff, referenced); err != nil {
+			return nil, err
 		}
-		if err := st.q.referencedOutputIDs(context.Background(), lower, upper, referenced); err != nil {
-			return fmt.Errorf("query referenced outputs in shard %s: %w", lower, err)
-		}
+		prefix := shardPrefix(shard)
+		var found []string
 		if includeBlobs {
-			if err := removeOrphanFilesInDir(filepath.Join(st.blobsDir, lower), referenced, ".zst"); err != nil {
-				return fmt.Errorf("remove orphan blobs in shard %s: %w", lower, err)
+			paths, err := orphanFilesInDir(filepath.Join(st.blobsDir, prefix), referenced, ".zst")
+			if err != nil {
+				return nil, fmt.Errorf("scan blobs in shard %s: %w", prefix, err)
 			}
+			found = append(found, paths...)
 		}
-		if err := removeOrphanFilesInDir(filepath.Join(retainedRoot(st.versionDir), lower), referenced, ".a", ".go"); err != nil {
-			return fmt.Errorf("remove orphan retained files in shard %s: %w", lower, err)
+		paths, err := orphanFilesInDir(filepath.Join(retainedRoot(st.versionDir), prefix), referenced, ".a", ".go")
+		if err != nil {
+			return nil, fmt.Errorf("scan retained files in shard %s: %w", prefix, err)
+		}
+		found = append(found, paths...)
+		if len(found) > 0 {
+			orphans[shard] = found
 		}
 	}
-	if includeBlobs {
-		if err := removeEmptyDirs(st.blobsDir); err != nil {
-			return err
-		}
-	}
-	return removeEmptyDirs(retainedRoot(st.versionDir))
+	return orphans, nil
 }
 
-func removeOrphanFilesInDir(root string, referenced map[string]struct{}, extensions ...string) error {
+func (st *store) removeOrphans(orphans map[int][]string) error {
+	if len(orphans) == 0 {
+		return nil
+	}
+	referenced := make(map[string]struct{})
+	for _, shard := range slices.Sorted(maps.Keys(orphans)) {
+		// A put writes its blob before inserting the catalog row, so a file that
+		// looked unreferenced during the unlocked scan may be referenced by now.
+		// Only shards with candidates are re-queried, which is why a healthy
+		// cache does no work here at all.
+		// The stale entries are gone by now, so an unfiltered query is both
+		// simpler and the honest check.
+		if err := st.referencedInShard(shard, 0, referenced); err != nil {
+			return err
+		}
+		for _, path := range orphans[shard] {
+			outputID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+			if _, ok := referenced[outputID]; ok {
+				continue
+			}
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove orphan file in shard %s: %w", shardPrefix(shard), err)
+			}
+		}
+	}
+	return nil
+}
+
+func shardPrefix(shard int) string {
+	return fmt.Sprintf("%02x", shard)
+}
+
+// referencedInShard replaces outputIDs with the output IDs that the given
+// shard's entries reference. Entries accessed before minAccessedAt are ignored,
+// which lets a scan plan around the entries it is about to delete; pass 0 to
+// count every entry.
+func (st *store) referencedInShard(shard int, minAccessedAt int64, outputIDs map[string]struct{}) error {
+	lower := shardPrefix(shard)
+	upper := shardPrefix(shard + 1)
+	if shard == 255 {
+		// Hex digits all sort below 'g', so this is the open upper bound.
+		upper = "g"
+	}
+	if err := st.q.referencedOutputIDs(context.Background(), lower, upper, minAccessedAt, outputIDs); err != nil {
+		return fmt.Errorf("query referenced outputs in shard %s: %w", lower, err)
+	}
+	return nil
+}
+
+func orphanFilesInDir(root string, referenced map[string]struct{}, extensions ...string) ([]string, error) {
+	var orphans []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -712,13 +942,14 @@ func removeOrphanFilesInDir(root string, referenced map[string]struct{}, extensi
 		}
 		outputID := strings.TrimSuffix(filepath.Base(path), ext)
 		if _, ok := referenced[outputID]; !ok {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
+			orphans = append(orphans, path)
 		}
 		return nil
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return orphans, nil
 }
 
 func removeEmptyDirs(root string) error {

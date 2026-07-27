@@ -223,6 +223,18 @@ WHERE accessed_at < ?`, cutoff)
 	return res.RowsAffected()
 }
 
+// oldestAccess returns the least recent access time in the catalog, or ok=false
+// when there are no entries. entries_accessed_at makes this a seek, so callers
+// can decide whether an age-based delete has anything to match before doing the
+// scan it would cost.
+func (c *catalog) oldestAccess(ctx context.Context) (int64, bool, error) {
+	var oldest sql.NullInt64
+	if err := c.db.QueryRowContext(ctx, `SELECT MIN(accessed_at) FROM entries`).Scan(&oldest); err != nil {
+		return 0, false, err
+	}
+	return oldest.Int64, oldest.Valid, nil
+}
+
 func (c *catalog) compressedSize(ctx context.Context) (int64, error) {
 	var size int64
 	err := c.db.QueryRowContext(ctx, `
@@ -284,11 +296,11 @@ func (c *catalog) listOutputs(
 	return outputs, nil
 }
 
-func (c *catalog) referencedOutputIDs(ctx context.Context, lower, upper string, outputIDs map[string]struct{}) error {
+func (c *catalog) referencedOutputIDs(ctx context.Context, lower, upper string, minAccessedAt int64, outputIDs map[string]struct{}) error {
 	rows, err := c.db.QueryContext(ctx, `
 SELECT DISTINCT output_id
 FROM entries
-WHERE output_id >= ? AND output_id < ?`, lower, upper)
+WHERE output_id >= ? AND output_id < ? AND accessed_at >= ?`, lower, upper, minAccessedAt)
 	if err != nil {
 		return err
 	}

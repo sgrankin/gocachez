@@ -1259,6 +1259,182 @@ func TestPruneSkipsScanWithinInterval(t *testing.T) {
 	}
 }
 
+func TestPlanPruneDoesNotTakeTheLifecycleLock(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	orphanBlob(t, st, strings.Repeat("f", 64))
+
+	// Deciding what to remove is the expensive part of a scan. Holding the lock
+	// across it is what stalled a starting build, since newStore takes the same
+	// lock, so planning must not need it.
+	lock := flock.New(st.lifecycleLockPath)
+	if err := lock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close() //nolint:errcheck
+
+	type result struct {
+		plan prunePlan
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		plan, err := st.planPrune(time.Now())
+		done <- result{plan: plan, err: err}
+	}()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		// A plan that found nothing would pass this test for the wrong reason.
+		if res.plan.empty() {
+			t.Fatal("planPrune found nothing to remove, so it proves nothing here")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("planPrune waited for the lifecycle lock")
+	}
+}
+
+func TestPruneDeletesNothingWhileARunIsRegistered(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	// This store's own run is registered, so the cache is in use. put and get
+	// never take the lifecycle lock, so an idle cache is the only thing that
+	// makes deletion safe — nothing may go while a build could be writing.
+	blobPath := orphanBlob(t, st, strings.Repeat("9", 64))
+	plan, err := st.planPrune(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.orphans) == 0 {
+		t.Fatal("planPrune did not see the orphan blob")
+	}
+	if err := st.applyPrune(plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("prune deleted while a run was registered: %v", err)
+	}
+	// And it must not stamp, or the scan it declined would be skipped for an
+	// hour after the cache went idle.
+	if _, err := os.Stat(pruneStampPath(st.versionDir)); !os.IsNotExist(err) {
+		t.Fatalf("prune stamped without scanning: stat err = %v, want not exist", err)
+	}
+}
+
+func TestPruneKeepsOrphanThatGainedAnEntryAfterPlanning(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+
+	outputID := strings.Repeat("7", 64)
+	blobPath := orphanBlob(t, st, outputID)
+	plan, err := st.planPrune(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.orphans) == 0 {
+		t.Fatal("planPrune did not see the orphan blob")
+	}
+
+	// A put writes its blob before inserting the catalog row, so a blob can be
+	// unreferenced while the unlocked scan walks it and referenced by the time
+	// the scan deletes. Deleting it then would leave a row with no blob.
+	now := time.Now()
+	if err := st.q.upsertEntry(context.Background(), entry{
+		ActionID:   strings.Repeat("8", 64),
+		OutputID:   outputID,
+		Size:       6,
+		CreatedAt:  now,
+		AccessedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.applyPrune(plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("blob referenced after planning was deleted anyway: %v", err)
+	}
+}
+
+func TestPruneKeepsRetainedFileRefreshedAfterPlanning(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir, maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputID := bytes.Repeat([]byte{95}, 32)
+	body := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 64))
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{96}, 32),
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	exportPath := retainedPath(cacheDir, outputID, ".a")
+	old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
+	if err := os.Chtimes(exportPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = newStore(config{dir: cacheDir, maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := st.planPrune(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.retained) == 0 {
+		t.Fatal("planPrune did not see the expired retained file")
+	}
+
+	// A build that ran while the scan was planning would have refreshed this
+	// via markRetainedFileUsed, which is the whole point of the mtime.
+	fresh := time.Now()
+	if err := os.Chtimes(exportPath, fresh, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.applyPrune(plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(exportPath); err != nil {
+		t.Fatalf("retained file refreshed after planning was deleted anyway: %v", err)
+	}
+}
+
 func TestPruneRechecksStampAfterTakingTheLock(t *testing.T) {
 	t.Parallel()
 
@@ -1274,13 +1450,18 @@ func TestPruneRechecksStampAfterTakingTheLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The stamp is read before the lock is taken, so two processes exiting
-	// together can both decide a scan is due. Whichever gets the lock second
-	// has to notice the first already did the work instead of repeating an
-	// O(cache) scan. Calling pruneLocked directly with a fresh stamp is exactly
-	// that process, and prune() cannot reach the state on its own.
+	// The stamp is read before the lock is taken, and again before anything is
+	// deleted, so two processes exiting together can both plan a scan. Whichever
+	// reaches the deletions second has to notice the first already did the work
+	// rather than repeating it. Planning and then applying against a stamp that
+	// went fresh in between is exactly that process, and prune() cannot reach
+	// the state on its own.
 	blobPath := orphanBlob(t, st, strings.Repeat("e", 64))
-	if err := st.pruneLocked(); err != nil {
+	plan, err := st.planPrune(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.applyPrune(plan); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(blobPath); err != nil {
@@ -1288,7 +1469,7 @@ func TestPruneRechecksStampAfterTakingTheLock(t *testing.T) {
 	}
 
 	expirePruneStamp(t, st.versionDir)
-	if err := st.pruneLocked(); err != nil {
+	if err := st.applyPrune(plan); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
@@ -1445,7 +1626,7 @@ func TestCatalogQueriesRespectCanceledContext(t *testing.T) {
 	if _, err := st.q.pruneCandidates(ctx); err == nil {
 		t.Fatal("pruneCandidates succeeded with canceled context")
 	}
-	if err := st.q.referencedOutputIDs(ctx, "00", "01", make(map[string]struct{})); err == nil {
+	if err := st.q.referencedOutputIDs(ctx, "00", "01", 0, make(map[string]struct{})); err == nil {
 		t.Fatal("referencedOutputIDs succeeded with canceled context")
 	}
 }

@@ -53,7 +53,15 @@ func (st *store) cleanLocked() error {
 	}
 	activeRuns := int64(0)
 	if st.q != nil {
-		if err := st.removeOrphanOutputFiles(false); err != nil {
+		// Clean holds the lifecycle lock throughout, so planning and removal
+		// see the same cache; the re-check inside removeOrphans is redundant
+		// here and harmless.
+		orphans, err := st.planOrphans(false, 0)
+		if err != nil {
+			_ = st.db.Close()
+			return err
+		}
+		if err := st.removeOrphans(orphans); err != nil {
 			_ = st.db.Close()
 			return err
 		}
