@@ -193,7 +193,28 @@ func withFileLock(path string, fn func() error) error {
 		_ = lock.Close()
 		return fmt.Errorf("lock cache lifecycle: %w", err)
 	}
+	return runUnlocking(lock, fn)
+}
 
+// withFileLockIfFree runs fn under path's lock, or reports false and runs
+// nothing if another process holds it.
+func withFileLockIfFree(path string, fn func() error) (bool, error) {
+	lock := flock.New(path)
+	locked, err := lock.TryLock()
+	if err != nil {
+		_ = lock.Close()
+		return false, fmt.Errorf("lock cache lifecycle: %w", err)
+	}
+	if !locked {
+		if closeErr := lock.Close(); closeErr != nil {
+			return false, fmt.Errorf("close cache lifecycle lock: %w", closeErr)
+		}
+		return false, nil
+	}
+	return true, runUnlocking(lock, fn)
+}
+
+func runUnlocking(lock *flock.Flock, fn func() error) error {
 	var err error
 	err = errors.Join(err, fn())
 	if unlockErr := lock.Unlock(); unlockErr != nil {

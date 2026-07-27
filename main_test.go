@@ -1040,7 +1040,7 @@ func TestPruneKeepsLiveBlobs(t *testing.T) {
 	}
 }
 
-func TestPruneUsesLifecycleLock(t *testing.T) {
+func TestPruneSkipsScanWhileLifecycleLockIsHeld(t *testing.T) {
 	t.Parallel()
 
 	st, err := newStore(config{
@@ -1050,6 +1050,10 @@ func TestPruneUsesLifecycleLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.close()
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	blobPath := orphanBlob(t, st, strings.Repeat("d", 64))
 
 	lock := flock.New(st.lifecycleLockPath)
 	if err := lock.Lock(); err != nil {
@@ -1057,22 +1061,31 @@ func TestPruneUsesLifecycleLock(t *testing.T) {
 	}
 	defer lock.Close() //nolint:errcheck
 
+	// Contended: prune must neither scan nor wait. Waiting is what would put
+	// another process's whole scan on this process's exit path.
 	done := make(chan error, 1)
-	go func() {
-		done <- st.prune()
-	}()
-
+	go func() { done <- st.prune() }()
 	select {
 	case err := <-done:
-		t.Fatalf("prune finished while lifecycle lock was held: %v", err)
-	case <-time.After(50 * time.Millisecond):
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("prune waited for the lifecycle lock instead of skipping")
+	}
+	if _, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("prune scanned without holding the lifecycle lock: %v", err)
 	}
 
+	// Uncontended: the stamp is still stale, so the next attempt does the work.
 	if err := lock.Unlock(); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-done; err != nil {
+	if err := st.prune(); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan blob stat err = %v, want not exist", err)
 	}
 }
 
@@ -1246,10 +1259,46 @@ func TestPruneSkipsScanWithinInterval(t *testing.T) {
 	}
 }
 
-func TestPruneSkipsWithoutWaitingForTheLifecycleLock(t *testing.T) {
+func TestPruneRechecksStampAfterTakingTheLock(t *testing.T) {
 	t.Parallel()
 
 	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stamp is read before the lock is taken, so two processes exiting
+	// together can both decide a scan is due. Whichever gets the lock second
+	// has to notice the first already did the work instead of repeating an
+	// O(cache) scan. Calling pruneLocked directly with a fresh stamp is exactly
+	// that process, and prune() cannot reach the state on its own.
+	blobPath := orphanBlob(t, st, strings.Repeat("e", 64))
+	if err := st.pruneLocked(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("scan repeated work another process had already stamped: %v", err)
+	}
+
+	expirePruneStamp(t, st.versionDir)
+	if err := st.pruneLocked(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+	}
+}
+
+// Not parallel: it swaps the global log sink to tell the two skip paths apart.
+func TestPruneWithFreshStampDoesNotTouchTheLifecycleLock(t *testing.T) {
+	st, err := newStore(config{dir: t.TempDir(), verbose: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1262,24 +1311,40 @@ func TestPruneSkipsWithoutWaitingForTheLifecycleLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Stand in for another process mid-scan. A prune with nothing to do must
-	// not queue behind it — that wait is the exit-time stall the gate exists
-	// to remove, so the stamp has to be checked before the lock is taken.
+	// Stand in for another process holding the lock.
 	lock := flock.New(st.lifecycleLockPath)
 	if err := lock.Lock(); err != nil {
 		t.Fatal(err)
 	}
 	defer lock.Close() //nolint:errcheck
 
-	done := make(chan error, 1)
-	go func() { done <- st.prune() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("prune waited for the lifecycle lock with a fresh stamp")
+	var logged bytes.Buffer
+	flags := log.Flags()
+	log.SetOutput(&logged)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(flags)
+	})
+
+	// A fresh stamp must short-circuit before the lock is attempted at all.
+	// Attempting it would report contention — and on an idle cache would take
+	// it, briefly blocking any build trying to open the store.
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logged.String(), "another process holds the cache lock") {
+		t.Fatalf("prune attempted the lifecycle lock with a fresh stamp: %q", logged.String())
+	}
+
+	// With the stamp stale it does attempt the lock, and reports the loss.
+	logged.Reset()
+	expirePruneStamp(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logged.String(), "another process holds the cache lock") {
+		t.Fatalf("contended prune logged %q, want a skip notice", logged.String())
 	}
 }
 

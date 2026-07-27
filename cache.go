@@ -397,7 +397,17 @@ func (st *store) prune() error {
 	if !st.pruneDue(time.Now()) {
 		return nil
 	}
-	return st.withLifecycleLock(st.pruneLocked)
+	// Skip rather than queue when the stamp is genuinely stale but someone else
+	// holds the lock. Whoever holds it is either running this same scan or
+	// opening a store — meaning the cache is in use and pruneLocked would
+	// decline anyway. Waiting would put the whole scan on this process's exit,
+	// which the go command waits for. The stamp stays stale, so the next exit
+	// retries.
+	scanned, err := withFileLockIfFree(st.lifecycleLockPath, st.pruneLocked)
+	if !scanned && err == nil && st.verbose {
+		log.Print("gocachez: skipped maintenance, another process holds the cache lock")
+	}
+	return err
 }
 
 // pruneDue reports whether the maintenance scan should run. A stamp dated in
