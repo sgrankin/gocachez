@@ -1454,6 +1454,78 @@ func TestPlanPruneSkipsEntryDeleteWhenNothingIsStale(t *testing.T) {
 	}
 }
 
+// A size-evicted output's retained export has to go with it. The orphan list is
+// built before eviction runs, so the output was still referenced then and its
+// retained files were not candidates — eviction has to offer them afterwards.
+func TestPruneRemovesRetainedFilesOfEvictedOutputs(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evicted := bytes.Repeat([]byte{101}, 32)
+	kept := bytes.Repeat([]byte{103}, 32)
+	body := goArchive(goPkgdef([]byte("uFAKE")), incompressibleBody(t, 8<<10, 1))
+	for _, tc := range []struct{ action, output []byte }{
+		{bytes.Repeat([]byte{100}, 32), evicted},
+		{bytes.Repeat([]byte{102}, 32), kept},
+	} {
+		if _, err := st.put(request{
+			ID:       1,
+			Command:  cmdPut,
+			ActionID: tc.action,
+			OutputID: tc.output,
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.close()
+
+	exportPath := retainedPath(cacheDir, evicted, ".a")
+	if _, err := os.Stat(exportPath); err != nil {
+		t.Fatalf("no retained export to evict: %v", err)
+	}
+
+	st, err = newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`,
+		unixMillis(time.Now().Add(-time.Hour)), hexOf(evicted)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+
+	total, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Room for one output, so the older of the two is evicted by size — not by
+	// age, which would have taken its retained file along a different path.
+	st.maxSize = total * 2 / 3
+	expirePruneStamp(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(st.blobPath(hexOf(evicted))); !os.IsNotExist(err) {
+		t.Fatalf("evicted blob stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(exportPath); !os.IsNotExist(err) {
+		t.Fatalf("retained export of an evicted output survived: stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(retainedPath(cacheDir, kept, ".a")); err != nil {
+		t.Fatalf("retained export of a surviving output was removed: %v", err)
+	}
+}
+
 func TestPruneDeletesNothingWhileARunIsRegistered(t *testing.T) {
 	t.Parallel()
 
@@ -1777,11 +1849,170 @@ func TestCatalogQueriesRespectCanceledContext(t *testing.T) {
 	if _, err := st.q.listOtherRuns(ctx, st.runID); err == nil {
 		t.Fatal("listOtherRuns succeeded with canceled context")
 	}
-	if _, err := st.q.pruneCandidates(ctx); err == nil {
-		t.Fatal("pruneCandidates succeeded with canceled context")
+	if _, err := st.q.evictionCandidates(ctx, 0, 1); err == nil {
+		t.Fatal("evictionCandidates succeeded with canceled context")
 	}
-	if err := st.q.referencedOutputIDs(ctx, "00", "01", 0, make(map[string]struct{})); err == nil {
+	if _, _, err := st.q.oldestAccessWatermark(ctx, 0, 1); err == nil {
+		t.Fatal("oldestAccessWatermark succeeded with canceled context")
+	}
+	if err := st.q.referencedOutputIDs(ctx, "00", "01", keepEveryEntry, make(map[string]struct{})); err == nil {
 		t.Fatal("referencedOutputIDs succeeded with canceled context")
+	}
+}
+
+// The point of walking entries_accessed_at is that one step costs a bounded
+// amount regardless of how big the cache is. Correctness does not depend on it —
+// an unbounded step still evicts the right things — so it needs asserting
+// directly or a regression would be invisible.
+func TestEvictionStepStaysBounded(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	const outputs = evictionSampleSize * 2
+	now := unixMillis(time.Now())
+	ctx := context.Background()
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range outputs {
+		action := sha256.Sum256(fmt.Appendf(nil, "bounded-action-%d", i))
+		output := sha256.Sum256(fmt.Appendf(nil, "bounded-output-%d", i))
+		// Distinct access times, so no step has to over-reach to avoid splitting
+		// a timestamp.
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
+			 VALUES (?, ?, 1, 1, ?, ?)`,
+			hex.EncodeToString(action[:]), hex.EncodeToString(output[:]), now, now-int64(outputs)+int64(i),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	watermark, ok, err := st.q.oldestAccessWatermark(ctx, 0, evictionSampleSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("no watermark for a catalog with entries")
+	}
+	candidates, err := st.q.evictionCandidates(ctx, 0, watermark)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) == 0 {
+		t.Fatal("a step returned no candidates, so it proves nothing here")
+	}
+	if len(candidates) > evictionSampleSize {
+		t.Fatalf("one step returned %d candidates from a %d-output catalog, want at most %d",
+			len(candidates), outputs, evictionSampleSize)
+	}
+}
+
+// Eviction walks entries_accessed_at in bounded steps, so both of the things
+// asserted here need a cache larger than one step: that the walk keeps advancing
+// until the budget is met, and that an output straddling a step boundary — old
+// entry inside it, fresh entry beyond — is ranked by its newest access and so
+// outlives outputs that are old by every measure.
+func TestPruneEvictsAcrossStepsWithoutTakingFreshOutputs(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	const doomed = evictionSampleSize + 600
+	for i := range doomed {
+		action := sha256.Sum256(fmt.Appendf(nil, "converge-action-%d", i))
+		output := sha256.Sum256(fmt.Appendf(nil, "converge-output-%d", i))
+		body := incompressibleBody(t, 64, int64(i))
+		if _, err := st.put(request{
+			ID:       int64(i),
+			Command:  cmdPut,
+			ActionID: action[:],
+			OutputID: output[:],
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The straddler: two action IDs onto one output, and big enough that the
+	// budget below has room for it and nothing else.
+	shared := bytes.Repeat([]byte{111}, 32)
+	oldAction := bytes.Repeat([]byte{112}, 32)
+	freshAction := bytes.Repeat([]byte{113}, 32)
+	sharedBody := incompressibleBody(t, 32<<10, 7)
+	for _, action := range [][]byte{oldAction, freshAction} {
+		if _, err := st.put(request{
+			ID:       1,
+			Command:  cmdPut,
+			ActionID: action,
+			OutputID: shared,
+			BodySize: int64(len(sharedBody)),
+		}, bufio.NewReader(encodedBody(sharedBody))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Everything ancient except the straddler's second action, which stays at
+	// now — so its oldest entry sits in the first step and its newest does not.
+	// Distinct times via rowid: a step has to include every entry sharing its
+	// watermark, so identical timestamps would collapse the whole cache into one
+	// step and defeat the point of the test.
+	ancient := unixMillis(time.Now().Add(-90 * 24 * time.Hour))
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entries SET accessed_at = ? + rowid WHERE action_id != ?`, ancient, hexOf(freshAction)); err != nil {
+		t.Fatal(err)
+	}
+	// Make the straddler's old entry the single oldest thing in the cache, so it
+	// falls inside the first step. Otherwise the first step never sees it and the
+	// ranking this test is about is never exercised.
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, ancient-1000, hexOf(oldAction)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+
+	sharedEntry, err := st.lookupEntry(hexOf(freshAction))
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Room for the straddler alone. Reaching that means evicting more of the
+	// ancient outputs than one step examines, so the walk has to take several.
+	st.maxSize = sharedEntry.CompressedSize * 3 / 2
+	if total-st.maxSize <= 0 {
+		t.Fatal("cache is not over budget: nothing would be evicted")
+	}
+
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after > st.maxSize {
+		t.Fatalf("cache is %d bytes after eviction, over its %d budget", after, st.maxSize)
+	}
+	if _, err := os.Stat(st.blobPath(hexOf(shared))); err != nil {
+		t.Fatalf("evicted the output whose newest access was fresh: %v", err)
 	}
 }
 

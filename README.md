@@ -154,12 +154,19 @@ Supported options:
 - Flag: `-dir`
 - Default: `os.UserCacheDir()/gocachez`
 
-**Maximum compressed cache size**
+**Maximum compressed blob size**
 
 - Config: `maxSize`
 - Environment: `GOCACHEZ_MAX_SIZE`
 - Flag: `-max-size`
 - Default: `20GiB`; `0` disables size-based pruning.
+
+This budgets the compressed blobs only — the figure `gocachez status` reports as
+"Blob max usage". Retained `go list` files are **not** counted against it; they
+are reclaimed by `maxAge`, and by following their blob when it is evicted. They
+are stored uncompressed, so on a cache of mostly Go package archives they can
+approach the size of the blobs themselves: check "Total stored" in `gocachez
+status` for what is actually on disk.
 
 **Maximum age of unused entries**
 
@@ -172,6 +179,13 @@ Supported options:
 Age-based pruning is independent of `maxSize`: entries and retained files that
 have not been used within `maxAge` are trimmed even while the cache is under its
 size limit.
+
+Size-based pruning evicts least-recently-used blobs, ranking an output by its
+most recent access across every action that maps to it. The ranking is
+approximate: rather than ordering the whole catalog, it walks the access-time
+index oldest-first in bounded steps and stops once it has freed enough. On a
+cache with high key churn most candidates are equally cold, so paying to rank
+them exactly buys nothing.
 
 Both limits are enforced by a maintenance scan that runs at most once an hour,
 and only when no build is using the cache — the scan is proportional to the size

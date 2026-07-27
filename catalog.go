@@ -450,12 +450,42 @@ func entriesHasColumn(ctx context.Context, db catalogDB, column string) (bool, e
 	return false, rows.Err()
 }
 
-func (c *catalog) pruneCandidates(ctx context.Context) ([]pruneCandidate, error) {
+// oldestAccessWatermark reports the access time of the limit'th entry at or
+// after from, which is how far a bounded eviction step advances. ok is false
+// when fewer than one entry remains.
+//
+// entries_accessed_at makes this a range scan with no sort.
+func (c *catalog) oldestAccessWatermark(ctx context.Context, from int64, limit int) (int64, bool, error) {
+	var watermark sql.NullInt64
+	err := c.db.QueryRowContext(ctx, `
+SELECT MAX(accessed_at) FROM (
+	SELECT accessed_at
+	FROM entries
+	WHERE accessed_at >= ?
+	ORDER BY accessed_at
+	LIMIT ?
+)`, from, limit).Scan(&watermark)
+	if err != nil {
+		return 0, false, err
+	}
+	return watermark.Int64, watermark.Valid, nil
+}
+
+// evictionCandidates returns the outputs whose *newest* access falls in
+// [from, watermark], least recently used first — the outputs entirely contained
+// in the region an eviction step has walked. An output with a fresher entry
+// elsewhere is deliberately absent: it is not actually old, and a later step
+// reaches it when the walk gets to that entry.
+func (c *catalog) evictionCandidates(ctx context.Context, from, watermark int64) ([]pruneCandidate, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT e.output_id, CAST(MAX(e.compressed_size) AS INTEGER)
-FROM entries AS e
-GROUP BY e.output_id
-ORDER BY MAX(e.accessed_at)`)
+SELECT output_id, CAST(MAX(compressed_size) AS INTEGER)
+FROM entries
+WHERE output_id IN (
+	SELECT output_id FROM entries WHERE accessed_at >= ? AND accessed_at <= ?
+)
+GROUP BY output_id
+HAVING MAX(accessed_at) <= ?
+ORDER BY MAX(accessed_at)`, from, watermark, watermark)
 	if err != nil {
 		return nil, err
 	}

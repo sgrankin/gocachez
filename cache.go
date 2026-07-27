@@ -51,6 +51,17 @@ const (
 	// installing less than maxSize/pruneOvershootDivisor still add up between
 	// interval-driven scans.
 	pruneOvershootDivisor = 16
+
+	// evictionSampleSize sets how far one eviction step reaches into
+	// entries_accessed_at. Steps repeat until the overshoot is covered, trading a
+	// few bounded queries for never ordering the whole catalog at once.
+	//
+	// It is a target rather than a hard cap: a step takes every entry sharing its
+	// watermark timestamp, since stopping mid-timestamp would skip entries a
+	// later step can no longer reach. Access times are milliseconds, so a step
+	// only grows past this when many entries were touched in the same
+	// millisecond.
+	evictionSampleSize = 2048
 )
 
 // encoderLevel trades put throughput for cache size. Measured over 900MiB of
@@ -518,7 +529,7 @@ func (st *store) planPrune(now time.Time) (prunePlan, error) {
 	if plan.liveRuns, err = st.planOldRetainedLiveDirs(now); err != nil {
 		return prunePlan{}, err
 	}
-	if plan.blobs, err = st.planToMaxSize(); err != nil {
+	if plan.blobs, err = st.planToMaxSize(plan.entryCutoff); err != nil {
 		return prunePlan{}, err
 	}
 	// Entries this scan is about to delete must not count as references, or the
@@ -593,7 +604,14 @@ func (st *store) deletePlanned(plan prunePlan) error {
 
 // planToMaxSize lists blobs to evict, least recently used first, or nothing if
 // the cache is within budget.
-func (st *store) planToMaxSize() ([]pruneCandidate, error) {
+//
+// It walks entries_accessed_at oldest-first in bounded steps and stops once it
+// has enough candidates to cover the overshoot, rather than ordering the whole
+// catalog. Exact LRU cost a full GROUP BY plus a sort — 344ms and 200k rows at
+// 200k outputs — to rank candidates that in a cache with high key churn are
+// almost all equally dead. Overshooting the estimate is harmless: evictToMaxSize
+// re-reads the real size and stops at the budget.
+func (st *store) planToMaxSize(entryCutoff int64) ([]pruneCandidate, error) {
 	if st.maxSize <= 0 {
 		return nil, nil
 	}
@@ -604,7 +622,38 @@ func (st *store) planToMaxSize() ([]pruneCandidate, error) {
 	if total <= st.maxSize {
 		return nil, nil
 	}
-	return st.pruneCandidates()
+
+	// Start at the age cutoff: everything older is being deleted anyway, so
+	// listing it for eviction is wasted work. need is therefore an
+	// overestimate, since the age delete frees bytes this does not count.
+	ctx := context.Background()
+	cursor := entryCutoff
+	need := total - st.maxSize
+	var candidates []pruneCandidate
+	for need > 0 {
+		watermark, ok, err := st.q.oldestAccessWatermark(ctx, cursor, evictionSampleSize)
+		if err != nil {
+			return nil, fmt.Errorf("find eviction watermark: %w", err)
+		}
+		if !ok {
+			break
+		}
+		batch, err := st.q.evictionCandidates(ctx, cursor, watermark)
+		if err != nil {
+			return nil, fmt.Errorf("query eviction candidates: %w", err)
+		}
+		for _, candidate := range batch {
+			candidates = append(candidates, candidate)
+			need -= candidate.size
+			if need <= 0 {
+				break
+			}
+		}
+		// Past the watermark, so a step whose outputs all had fresher entries
+		// still makes progress instead of re-reading the same region.
+		cursor = watermark + 1
+	}
+	return candidates, nil
 }
 
 // evictToMaxSize removes least-recently-used blobs until the cache is within
@@ -666,14 +715,6 @@ func (st *store) compressedSize() (int64, error) {
 		return 0, fmt.Errorf("calculate compressed size: %w", err)
 	}
 	return total, nil
-}
-
-func (st *store) pruneCandidates() ([]pruneCandidate, error) {
-	candidates, err := st.q.pruneCandidates(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("query prune candidates: %w", err)
-	}
-	return candidates, nil
 }
 
 // planOldEntries returns the cutoff to delete by, or 0 when no entry is old
