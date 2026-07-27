@@ -50,6 +50,19 @@ const (
 	pruneOvershootDivisor = 16
 )
 
+// encoderLevel trades put throughput for cache size. Measured over 900MiB of
+// real go build output, relative to SpeedFastest: 10% smaller for 34% less
+// single-core compression throughput, which end to end through the protocol is
+// only 8% (129 -> 119 MiB/s) because puts are dominated by decoding the request
+// body, not by zstd. Decompression — the cache-hit path, and far more frequent
+// than puts — gets 9% faster (800 -> 872 MiB/s), since there is less to read.
+// SpeedBestCompression is a cliff: 5 points more ratio for a third of the put
+// throughput.
+//
+// Blobs already on disk keep whatever level wrote them; zstd frames are
+// self-describing, so changing this needs no migration.
+const encoderLevel = zstd.SpeedBetterCompression
+
 var decoderOptions = []zstd.DOption{
 	zstd.WithDecoderConcurrency(1),
 	zstd.WithDecoderLowmem(true),
@@ -302,7 +315,7 @@ func (st *store) getEncoder(w io.Writer) (*zstd.Encoder, error) {
 		enc.Reset(w)
 		return enc, nil
 	}
-	return zstd.NewWriter(w, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderCRC(true))
+	return zstd.NewWriter(w, zstd.WithEncoderLevel(encoderLevel), zstd.WithEncoderCRC(true))
 }
 
 func (st *store) putEncoder(enc *zstd.Encoder) {
