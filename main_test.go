@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -4130,6 +4131,35 @@ func TestParseFlagsUsesEnvironmentOverrides(t *testing.T) {
 	if !cfg.verbose {
 		t.Fatal("verbose = false, want true")
 	}
+}
+
+func TestRootHelpListsEveryFlag(t *testing.T) {
+	t.Parallel()
+
+	// Deliberately undocumented: profiling knobs for working on gocachez itself,
+	// not for configuring a cache.
+	hidden := map[string]bool{"cpuprofile": true, "memprofile": true}
+
+	fs := flag.NewFlagSet("gocachez", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	bindFlags(fs, &rawFlags{})
+	// Match where a flag is *listed*, not merely mentioned: one flag's
+	// description can name another, which would otherwise pass for it.
+	listed := map[string]bool{}
+	for line := range strings.SplitSeq(rootHelp, "\n") {
+		name, _, _ := strings.Cut(strings.TrimPrefix(strings.TrimSpace(line), "-"), " ")
+		if name != "" {
+			listed[name] = true
+		}
+	}
+	fs.VisitAll(func(f *flag.Flag) {
+		if hidden[f.Name] {
+			return
+		}
+		if !listed[f.Name] {
+			t.Errorf("-%s is accepted but not listed in rootHelp", f.Name)
+		}
+	})
 }
 
 func TestParseFlagsResolvesMaxRetainedAge(t *testing.T) {

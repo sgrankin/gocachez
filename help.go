@@ -45,12 +45,15 @@ Commands:
   status   Show cache state
 
 Flags:
-  -config path    JSON config file
-  -dir path       cache directory
-  -max-size size  maximum compressed cache size, or 0 to disable pruning
-  -max-age dur    maximum age of unused entries, or 0 to disable age-based pruning
-  -v              log cache maintenance to stderr
-  -h              show help
+  -config path            JSON config file
+  -dir path               cache directory
+  -max-size size          maximum compressed blob size, or 0 to disable pruning
+  -max-age dur            maximum age of unused entries, or 0 to disable
+                          age-based pruning
+  -max-retained-age dur   maximum age of unused retained go-list files; 0 or
+                          unset follows -max-age
+  -v                      log cache maintenance to stderr
+  -h                      show help
 `
 
 const cleanHelp = `Usage:

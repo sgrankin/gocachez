@@ -73,6 +73,33 @@ type argError struct{ err error }
 func (e *argError) Error() string { return e.err.Error() }
 func (e *argError) Unwrap() error { return e.err }
 
+// rawFlags holds command-line values before they are validated and merged with
+// the config file and environment.
+type rawFlags struct {
+	configPath     string
+	dir            string
+	maxSize        string
+	maxAge         string
+	maxRetainedAge string
+	verbose        bool
+	cpuProfile     string
+	memProfile     string
+}
+
+// bindFlags defines every flag gocachez accepts. It is a function of its own so
+// that a test can check the help text lists all of them — the help is written by
+// hand and would otherwise drift silently.
+func bindFlags(fs *flag.FlagSet, raw *rawFlags) {
+	fs.StringVar(&raw.configPath, "config", raw.configPath, "JSON config file")
+	fs.StringVar(&raw.dir, "dir", "", "cache directory")
+	fs.StringVar(&raw.maxSize, "max-size", "", "maximum compressed blob size, or 0 to disable pruning")
+	fs.StringVar(&raw.maxAge, "max-age", "", "maximum age of unused entries, or 0 to disable age-based pruning")
+	fs.StringVar(&raw.maxRetainedAge, "max-retained-age", "", "maximum age of unused retained go-list files; 0 or unset follows -max-age")
+	fs.BoolVar(&raw.verbose, "v", false, "log cache maintenance to stderr")
+	fs.StringVar(&raw.cpuProfile, "cpuprofile", "", "write CPU profile to file")
+	fs.StringVar(&raw.memProfile, "memprofile", "", "write memory profile to file")
+}
+
 func parseFlagOperands(args []string) (config, []string, error) {
 	cfg, err := defaultConfig()
 	if err != nil {
@@ -80,22 +107,20 @@ func parseFlagOperands(args []string) (config, []string, error) {
 	}
 	configPath, configRequired := defaultConfigPath()
 
-	var flagDir, flagMaxSize, flagMaxAge, flagMaxRetainedAge string
-	var flagVerbose bool
+	var raw rawFlags
+	raw.configPath = configPath
 
 	fs := flag.NewFlagSet("gocachez", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.StringVar(&configPath, "config", configPath, "JSON config file")
-	fs.StringVar(&flagDir, "dir", "", "cache directory")
-	fs.StringVar(&flagMaxSize, "max-size", "", "maximum compressed cache size, or 0 to disable pruning")
-	fs.StringVar(&flagMaxAge, "max-age", "", "maximum age of unused entries, or 0 to disable age-based pruning")
-	fs.StringVar(&flagMaxRetainedAge, "max-retained-age", "", "maximum age of unused retained go-list files; 0 or unset follows -max-age")
-	fs.BoolVar(&flagVerbose, "v", false, "log cache maintenance to stderr")
-	fs.StringVar(&cfg.cpuProfile, "cpuprofile", "", "write CPU profile to file")
-	fs.StringVar(&cfg.memProfile, "memprofile", "", "write memory profile to file")
+	bindFlags(fs, &raw)
 	if err := fs.Parse(args); err != nil {
 		return config{}, nil, &argError{err}
 	}
+
+	configPath = raw.configPath
+	flagDir, flagMaxSize, flagMaxAge, flagMaxRetainedAge := raw.dir, raw.maxSize, raw.maxAge, raw.maxRetainedAge
+	flagVerbose := raw.verbose
+	cfg.cpuProfile, cfg.memProfile = raw.cpuProfile, raw.memProfile
 
 	visited := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) {
