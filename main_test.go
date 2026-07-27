@@ -1594,6 +1594,59 @@ func TestAccessTimesFlushOnClose(t *testing.T) {
 	}
 }
 
+func TestRunAnnouncesCommandsBeforeOpeningStore(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cacheDir, "v1"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	lock := flock.New(filepath.Join(cacheDir, "v1", "lifecycle.lock"))
+	if err := lock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close() //nolint:errcheck
+
+	var stdin bytes.Buffer
+	writeJSON(t, &stdin, request{ID: 1, Command: cmdClose})
+	stdoutR, stdoutW := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		err := run([]string{"-dir", cacheDir, "-max-size", "0"}, &stdin, stdoutW)
+		_ = stdoutW.CloseWithError(err)
+		done <- err
+	}()
+
+	// The handshake must not wait on the store, whose lock is held here. Keep
+	// draining afterwards: the pipe is unbuffered, so run blocks on its next
+	// write until someone reads.
+	hello := make(chan response, 1)
+	go func() {
+		dec := json.NewDecoder(stdoutR)
+		var res response
+		if err := dec.Decode(&res); err != nil {
+			return
+		}
+		hello <- res
+		_, _ = io.Copy(io.Discard, stdoutR)
+	}()
+	select {
+	case res := <-hello:
+		if len(res.KnownCommands) != 3 {
+			t.Errorf("KnownCommands = %v, want 3", res.KnownCommands)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no handshake while the lifecycle lock was held")
+	}
+
+	if err := lock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunProtocol(t *testing.T) {
 	t.Parallel()
 

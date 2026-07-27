@@ -86,18 +86,23 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 		return writeHelp(stdout, runModeProtocol)
 	}
 
-	st, err := newStore(cfg)
-	if err != nil {
-		return err
-	}
-	defer st.close()
-
+	// Announce capabilities before touching the cache. The go command expects
+	// this to be instant and reports a helper that is slow to answer as hung
+	// ("# still waiting for GOCACHEPROG ..."), but opening the store waits on
+	// the lifecycle lock, which another process may hold for a maintenance
+	// scan. The answer is a fixed list, so nothing about it needs the store.
 	rw := &responseWriter{enc: json.NewEncoder(stdout)}
 	if err := rw.write(response{
 		KnownCommands: []command{cmdGet, cmdPut, cmdClose},
 	}); err != nil {
 		return err
 	}
+
+	st, err := newStore(cfg)
+	if err != nil {
+		return err
+	}
+	defer st.close()
 
 	br := bufio.NewReader(stdin)
 	var wg sync.WaitGroup
