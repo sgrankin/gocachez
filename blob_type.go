@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"os"
 	"runtime"
@@ -73,14 +72,10 @@ func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
 
 // blobTypeStatuses classifies the given catalog outputs into the per-kind
 // breakdown, decompressing only blobs without a current cached classification
-// and best-effort caching any it computes.
+// and caching any it computes.
 func blobTypeStatuses(dbPath, blobsDir string, outputs []catalogOutput) []blobTypeStatus {
 	byKind, classified := classifyBlobTypes(blobsDir, outputs)
-	if len(classified) > 0 {
-		// Best effort: cache the classifications so later runs skip
-		// decompressing these blobs. Ignore failures (e.g. a read-only cache).
-		_ = persistBlobTypes(dbPath, classified)
-	}
+	persistClassifications(dbPath, updateBlobTypeSQL, blobClassifierVersion, classified)
 
 	statuses := make([]blobTypeStatus, 0, len(byKind))
 	for _, status := range byKind {
@@ -93,28 +88,6 @@ func blobTypeStatuses(dbPath, blobsDir string, outputs []catalogOutput) []blobTy
 		return statuses[i].kind.label() < statuses[j].kind.label()
 	})
 	return statuses
-}
-
-func persistBlobTypes(dbPath string, classified map[string]blobTypeKind) error {
-	db, err := openDB(dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close() //nolint:errcheck
-
-	ctx := context.Background()
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	qtx := newCatalog(db).withTx(tx)
-	for outputID, kind := range classified {
-		if err := qtx.updateBlobType(ctx, outputID, kind, blobClassifierVersion); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
-	return tx.Commit()
 }
 
 type blobTypeResult struct {

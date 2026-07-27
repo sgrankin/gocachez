@@ -2334,6 +2334,50 @@ func TestStatusCachesBlobTypes(t *testing.T) {
 	assertBlobKind(t, statuses, blobTypeGoPackageArchive, 1)
 }
 
+func TestStatusCachesClassificationsPastOneBatch(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One past a full batch, so the trailing partial batch has to commit too.
+	const outputs = classificationBatch + 1
+	body := []byte("package main\n")
+	for i := range outputs {
+		action := sha256.Sum256(fmt.Appendf(nil, "batch-action-%d", i))
+		output := sha256.Sum256(fmt.Appendf(nil, "batch-output-%d", i))
+		if _, err := st.put(request{
+			ID:       int64(i),
+			Command:  cmdPut,
+			ActionID: action[:],
+			OutputID: output[:],
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.close()
+
+	versionDir, blobsDir, _, _ := cachePaths(config{dir: cacheDir})
+	dbPath := filepath.Join(versionDir, "cache.db")
+	if _, err := readBlobTypeStatus(dbPath, blobsDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// With every blob gone, only cached classifications can still name them;
+	// a dropped trailing batch would surface as unreadable blobs.
+	if err := os.RemoveAll(blobsDir); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := readBlobTypeStatus(dbPath, blobsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBlobKind(t, statuses, blobTypeGoSource, outputs)
+}
+
 func TestStatusReclassifiesWhenClassifierVersionChanges(t *testing.T) {
 	t.Parallel()
 

@@ -476,9 +476,7 @@ func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, in
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	if len(classified) > 0 {
-		_ = persistRetainedTypes(dbPath, classified)
-	}
+	persistClassifications(dbPath, updateRetainedTypeSQL, retainedClassifierVersion, classified)
 
 	statuses := make([]retainedTypeStatus, 0, len(byKind))
 	for _, status := range byKind {
@@ -493,27 +491,6 @@ func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, in
 	return files, size, statuses, nil
 }
 
-func persistRetainedTypes(dbPath string, classified map[string]retainedTypeKind) error {
-	db, err := openDB(dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close() //nolint:errcheck
-
-	ctx := context.Background()
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	qtx := newCatalog(db).withTx(tx)
-	for outputID, kind := range classified {
-		if err := qtx.updateRetainedType(ctx, outputID, kind); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-	}
-	return tx.Commit()
-}
 
 func retainedFileKind(path string) retainedTypeKind {
 	switch filepath.Ext(path) {

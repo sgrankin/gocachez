@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 )
 
 type catalogDB interface {
@@ -94,10 +95,6 @@ func (c *catalog) close() error {
 		}
 	}
 	return err
-}
-
-func (c *catalog) withTx(tx *sql.Tx) *catalog {
-	return &catalog{db: tx}
 }
 
 func (c *catalog) registerRun(ctx context.Context, runID, path, lockPath string, createdAt int64) error {
@@ -309,20 +306,98 @@ WHERE output_id >= ? AND output_id < ?`, lower, upper)
 	return rows.Err()
 }
 
-func (c *catalog) updateBlobType(ctx context.Context, outputID string, kind blobTypeKind, classifierVersion int64) error {
-	_, err := c.db.ExecContext(ctx, `
+const updateBlobTypeSQL = `
 UPDATE entries
 SET blob_type = ?, blob_type_version = ?
-WHERE output_id = ?`, int64(kind), classifierVersion, outputID)
+WHERE output_id = ?`
+
+const updateRetainedTypeSQL = `
+UPDATE entries
+SET retained_type = ?, retained_type_version = ?
+WHERE output_id = ?`
+
+func (c *catalog) updateBlobType(ctx context.Context, outputID string, kind blobTypeKind, classifierVersion int64) error {
+	_, err := c.db.ExecContext(ctx, updateBlobTypeSQL, int64(kind), classifierVersion, outputID)
 	return err
 }
 
 func (c *catalog) updateRetainedType(ctx context.Context, outputID string, kind retainedTypeKind) error {
-	_, err := c.db.ExecContext(ctx, `
-UPDATE entries
-SET retained_type = ?, retained_type_version = ?
-WHERE output_id = ?`, int64(kind), retainedClassifierVersion, outputID)
+	_, err := c.db.ExecContext(ctx, updateRetainedTypeSQL, int64(kind), retainedClassifierVersion, outputID)
 	return err
+}
+
+// classificationBatch bounds how many rows one transaction updates. Status can
+// classify the entire cache in a single pass, and SQLite has one write slot:
+// committing that as a single transaction held it long enough to stall a
+// concurrent put for 3.9s against its 5s busy timeout on a 200k-output cache,
+// and past that threshold the put fails outright.
+const classificationBatch = 1000
+
+// persistClassifications caches classifications so later status runs can skip
+// reclassifying. Batches commit independently, so a failure part way through
+// still leaves the earlier ones cached and shrinks the next run's work.
+//
+// Failures are warned about rather than returned: the report the caller is
+// building is correct either way, only the next run's cost is affected. They
+// must not be silent, though — a persist that keeps losing the write race to
+// concurrent builds leaves status reclassifying the whole cache every time.
+func persistClassifications[K ~int](dbPath, updateSQL string, version int64, classified map[string]K) {
+	if err := writeClassifications(dbPath, updateSQL, version, classified); err != nil {
+		log.Printf("gocachez: caching classifications failed, the next status will redo this work: %v", err)
+	}
+}
+
+func writeClassifications[K ~int](dbPath, updateSQL string, version int64, classified map[string]K) error {
+	if len(classified) == 0 {
+		return nil
+	}
+	db, err := openDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close() //nolint:errcheck
+
+	ctx := context.Background()
+	stmt, err := db.PrepareContext(ctx, updateSQL)
+	if err != nil {
+		return fmt.Errorf("prepare classification update: %w", err)
+	}
+	defer stmt.Close() //nolint:errcheck
+
+	batch := make(map[string]K, classificationBatch)
+	for outputID, kind := range classified {
+		batch[outputID] = kind
+		if len(batch) < classificationBatch {
+			continue
+		}
+		if err := commitClassifications(ctx, db, stmt, version, batch); err != nil {
+			return err
+		}
+		clear(batch)
+	}
+	return commitClassifications(ctx, db, stmt, version, batch)
+}
+
+func commitClassifications[K ~int](ctx context.Context, db *sql.DB, stmt *sql.Stmt, version int64, batch map[string]K) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin classification transaction: %w", err)
+	}
+	txStmt := tx.StmtContext(ctx, stmt)
+	defer txStmt.Close() //nolint:errcheck
+	for outputID, kind := range batch {
+		if _, err := txStmt.ExecContext(ctx, int64(kind), version, outputID); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("cache classification: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit classifications: %w", err)
+	}
+	return nil
 }
 
 func entriesHasColumn(ctx context.Context, db catalogDB, column string) (bool, error) {
