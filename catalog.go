@@ -206,10 +206,33 @@ func (c *catalog) touchEntries(ctx context.Context, tx *sql.Tx, accessed map[str
 	return nil
 }
 
-func (c *catalog) deleteEntriesByOutputID(ctx context.Context, outputID string) (int64, error) {
-	res, err := c.db.ExecContext(ctx, `
+// deleteEntriesByOutputID removes every entry for an output unconditionally. That
+// is right for a blob found corrupt or missing, where the entries have to go
+// whatever their age; eviction wants evictEntriesByOutputID instead.
+func (c *catalog) deleteEntriesByOutputID(ctx context.Context, outputID string) error {
+	_, err := c.db.ExecContext(ctx, `
 DELETE FROM entries
 WHERE output_id = ?`, outputID)
+	return err
+}
+
+// evictEntriesByOutputID removes an output's entries only if nothing has read it
+// since it was chosen. Candidate selection and deletion are separated by the whole
+// planning walk, and a build that ran in between flushes its reads on the way out,
+// so without this an output picked as the coldest in the cache is deleted even
+// after becoming the hottest.
+//
+// It has to be all or nothing. Deleting the actions that are still cold while
+// leaving a warm one behind would report rows affected, the caller would unlink the
+// blob, and the surviving rows would point at nothing.
+func (c *catalog) evictEntriesByOutputID(ctx context.Context, outputID string, accessedAt int64) (int64, error) {
+	res, err := c.db.ExecContext(ctx, `
+DELETE FROM entries
+WHERE output_id = ?
+  AND NOT EXISTS (
+    SELECT 1 FROM entries newer
+    WHERE newer.output_id = ? AND newer.accessed_at > ?
+  )`, outputID, outputID, accessedAt)
 	if err != nil {
 		return 0, err
 	}
@@ -478,7 +501,7 @@ SELECT MAX(accessed_at) FROM (
 // reaches it when the walk gets to that entry.
 func (c *catalog) evictionCandidates(ctx context.Context, from, watermark int64) ([]pruneCandidate, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT output_id, CAST(MAX(compressed_size) AS INTEGER)
+SELECT output_id, CAST(MAX(compressed_size) AS INTEGER), MAX(accessed_at)
 FROM entries
 WHERE output_id IN (
 	SELECT output_id FROM entries WHERE accessed_at >= ? AND accessed_at <= ?
@@ -494,7 +517,7 @@ ORDER BY MAX(accessed_at)`, from, watermark, watermark)
 	var candidates []pruneCandidate
 	for rows.Next() {
 		var candidate pruneCandidate
-		if err := rows.Scan(&candidate.outputID, &candidate.size); err != nil {
+		if err := rows.Scan(&candidate.outputID, &candidate.size, &candidate.accessedAt); err != nil {
 			return nil, err
 		}
 		candidates = append(candidates, candidate)

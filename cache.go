@@ -475,7 +475,7 @@ func (st *store) deleteOutput(outputID string) error {
 	if err := os.Remove(st.blobPath(outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove bad blob: %w", err)
 	}
-	if _, err := st.q.deleteEntriesByOutputID(context.Background(), outputID); err != nil {
+	if err := st.q.deleteEntriesByOutputID(context.Background(), outputID); err != nil {
 		return fmt.Errorf("delete bad output entries: %w", err)
 	}
 	st.deleteMaterialized(outputID)
@@ -721,12 +721,16 @@ func (st *store) markPruned() error {
 // was being built. applyPrune therefore re-verifies each group under the lock
 // rather than trusting the plan:
 //
-//   - entries: the DELETE re-evaluates accessed_at, so an entry a build touched
-//     no longer matches.
-//   - retained files and live runs: their mtimes are re-read, so anything a
-//     build refreshed is kept.
-//   - blobs: the cache size is re-read, so eviction stops as soon as the cache
-//     is back under budget.
+//   - expired entries: the DELETE re-evaluates accessed_at, so an entry a build
+//     touched no longer matches.
+//   - retained files: their mtimes are re-read, so anything a build refreshed is
+//     kept.
+//   - blobs: two separate checks, and conflating them was a bug. The cache size
+//     is re-read, which decides how many to evict; each candidate's most recent
+//     access is re-asserted, which decides whether it is still a candidate at
+//     all. Only the first was here at first, so an output picked as the coldest
+//     in the cache was evicted even if a build had read it — and flushed that
+//     read — during the walk.
 //   - orphans: the shards holding candidates are re-queried, so a file that has
 //     since gained a catalog entry is kept. This is the one that would otherwise
 //     matter — a put writes its blob before inserting the row, so a blob can be
@@ -906,10 +910,13 @@ func (st *store) evictToMaxSize(candidates []pruneCandidate) ([]string, error) {
 		// would end the loop early and leave the cache over budget — which is
 		// the whole point of eviction. The blobs are not leaked: an output with
 		// no surviving entries is in plan.orphans.
-		rows, err := st.q.deleteEntriesByOutputID(context.Background(), candidate.outputID)
+		rows, err := st.q.evictEntriesByOutputID(context.Background(), candidate.outputID, candidate.accessedAt)
 		if err != nil {
 			return nil, fmt.Errorf("delete pruned entries: %w", err)
 		}
+		// Either the entries were already gone, or something read the output since
+		// it was chosen and it is no longer a candidate. Neither credits bytes, and
+		// neither may unlink the blob.
 		if rows == 0 {
 			continue
 		}
@@ -933,6 +940,10 @@ const keepEveryEntry = math.MinInt64
 type pruneCandidate struct {
 	outputID string
 	size     int64
+	// accessedAt is the output's most recent access when it was chosen. Deletion
+	// re-asserts it, so a build that read this output during the planning walk
+	// keeps it.
+	accessedAt int64
 }
 
 func (st *store) compressedSize() (int64, error) {

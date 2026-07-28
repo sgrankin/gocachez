@@ -885,7 +885,7 @@ func TestPruneRemovesOrphanRetainedFiles(t *testing.T) {
 	if _, err := os.Stat(exportPath); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.q.deleteEntriesByOutputID(context.Background(), hexOf(outputID)); err != nil {
+	if err := st.q.deleteEntriesByOutputID(context.Background(), hexOf(outputID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
@@ -1403,6 +1403,187 @@ func TestPlanPruneDoesNotTakeTheLifecycleLock(t *testing.T) {
 // candidates from the catalog as it was before the age delete ran. Crediting a
 // candidate whose rows the age delete already removed ends the loop early and
 // leaves the cache over budget after a completed, stamped scan.
+// planPrune runs without the lifecycle lock, so a build can start, read, and exit
+// while it walks — and it now flushes its reads every 30s and again on the way out.
+// Eviction chose its candidates before any of that, so the delete has to re-assert
+// that the output is still cold. Without it, the output picked as the coldest in the
+// cache is evicted precisely when it has just become the hottest.
+func TestEvictionKeepsAnOutputReadDuringPlanning(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	outputs := make([][]byte, 0, 6)
+	for i := range 6 {
+		action := sha256.Sum256(fmt.Appendf(nil, "warm-action-%d", i))
+		output := sha256.Sum256(fmt.Appendf(nil, "warm-output-%d", i))
+		body := incompressibleBody(t, 4096, int64(i))
+		if _, err := st.put(request{
+			ID:       int64(i),
+			Command:  cmdPut,
+			ActionID: action[:],
+			OutputID: output[:],
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+		outputs = append(outputs, output[:])
+	}
+	// Distinct access times, so the eviction order is determined rather than
+	// arbitrary and the coldest candidate is a known output.
+	for i, output := range outputs {
+		if _, err := st.db.ExecContext(context.Background(),
+			`UPDATE entries SET accessed_at = ? WHERE output_id = ?`,
+			unixMillis(time.Now())-int64(len(outputs)-i)*1000, hexOf(output)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	before, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.maxSize = before / 2
+
+	plan, err := st.planPrune(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.blobs) == 0 {
+		t.Fatal("nothing planned for eviction; the budget did not bite")
+	}
+	coldest := plan.blobs[0].outputID
+
+	// A build reads the coldest output and exits, flushing the access — exactly
+	// what the periodic flush now makes visible mid-pass.
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`,
+		unixMillis(time.Now()), coldest); err != nil {
+		t.Fatal(err)
+	}
+
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.applyPrune(plan); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(st.blobPath(coldest)); err != nil {
+		t.Errorf("evicted an output read during planning: %v", err)
+	}
+	var surviving int
+	if err := st.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM entries WHERE output_id = ?`, coldest).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving == 0 {
+		t.Error("deleted the entries of an output read during planning")
+	}
+	// It still has to have evicted something, or the guard is just disabling
+	// eviction.
+	after, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after >= before {
+		t.Errorf("compressed size %d did not fall from %d; nothing was evicted", after, before)
+	}
+}
+
+// Several actions can map to one output. The guard has to be per output, not per
+// row: deleting the actions that are still cold while a warm one survives reports
+// rows affected, so the caller unlinks the blob and leaves that row pointing at
+// nothing — a hit that resolves to a missing file.
+func TestEvictionKeepsAnOutputWhoseOtherActionWentWarm(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	shared := sha256.Sum256([]byte("shared-output"))
+	body := incompressibleBody(t, 8192, 99)
+	twoActions := make([][]byte, 0, 2)
+	for i := range 2 {
+		action := sha256.Sum256(fmt.Appendf(nil, "shared-action-%d", i))
+		if _, err := st.put(request{
+			ID: int64(i), Command: cmdPut,
+			ActionID: action[:], OutputID: shared[:], BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+		twoActions = append(twoActions, action[:])
+	}
+	// A second, warmer output so there is something else to evict and the budget
+	// is reachable without the shared one.
+	other := sha256.Sum256([]byte("other-output"))
+	otherAction := sha256.Sum256([]byte("other-action"))
+	otherBody := incompressibleBody(t, 8192, 100)
+	if _, err := st.put(request{
+		ID: 9, Command: cmdPut,
+		ActionID: otherAction[:], OutputID: other[:], BodySize: int64(len(otherBody)),
+	}, bufio.NewReader(encodedBody(otherBody))); err != nil {
+		t.Fatal(err)
+	}
+
+	now := unixMillis(time.Now())
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`, now-10_000, hexOf(shared[:])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`, now, hexOf(other[:])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	before, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.maxSize = before / 4
+
+	plan, err := st.planPrune(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.blobs) == 0 || plan.blobs[0].outputID != hexOf(shared[:]) {
+		t.Fatalf("expected the shared output to be the coldest candidate, got %v", plan.blobs)
+	}
+
+	// One of its two actions is read and flushed while the plan is in hand.
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, now+10_000, hexOf(twoActions[0])); err != nil {
+		t.Fatal(err)
+	}
+
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.applyPrune(plan); err != nil {
+		t.Fatal(err)
+	}
+
+	var surviving int
+	if err := st.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM entries WHERE output_id = ?`, hexOf(shared[:])).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving == 0 {
+		t.Fatal("evicted a warm output entirely")
+	}
+	// Whatever rows survive must still resolve, so the blob has to be there.
+	if _, err := os.Stat(st.blobPath(hexOf(shared[:]))); err != nil {
+		t.Errorf("%d entries survive but the blob is gone: %v", surviving, err)
+	}
+}
+
 func TestPruneEnforcesMaxSizeWhenMaxAgeAlsoFires(t *testing.T) {
 	t.Parallel()
 
