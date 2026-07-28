@@ -423,8 +423,17 @@ func (st *store) putDecoder(dec *zstd.Decoder) {
 	st.decoderPool.Put(dec)
 }
 
+// createLiveFile makes the uncompressed file whose path is handed back to the go
+// command. It is sharded within the run directory for the same reason blobs are:
+// a build materialises one of these per output it touches, and a large one reached
+// 28,000 in a single directory, where create and unlink churn costs filesystem
+// metadata and journal IO rather than just lookups.
 func (st *store) createLiveFile(outputHex string) (string, error) {
-	file, err := os.CreateTemp(st.runDir, outputHex+"-*")
+	dir := filepath.Join(st.runDir, outputShard(outputHex))
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		return "", fmt.Errorf("create live shard dir: %w", err)
+	}
+	file, err := os.CreateTemp(dir, outputHex+"-*")
 	if err != nil {
 		return "", fmt.Errorf("create live file: %w", err)
 	}
@@ -1250,11 +1259,17 @@ func (st *store) blobDir(outputHex string) string {
 }
 
 func blobDir(blobsDir, outputHex string) string {
-	shard := "xx"
-	if len(outputHex) >= 2 {
-		shard = outputHex[:2]
+	return filepath.Join(blobsDir, outputShard(outputHex))
+}
+
+// outputShard spreads content-addressed files over 256 directories by the first
+// byte of their output ID. Anything without one lands together under "xx", which
+// is a name no hex prefix can take.
+func outputShard(outputHex string) string {
+	if len(outputHex) < 2 {
+		return "xx"
 	}
-	return filepath.Join(blobsDir, shard)
+	return outputHex[:2]
 }
 
 func (st *store) blobPath(outputHex string) string {

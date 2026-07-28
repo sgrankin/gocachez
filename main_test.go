@@ -354,6 +354,12 @@ func TestCacheRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+// runDirOf recovers a live file's run directory. Live files sit one shard deep
+// inside it, so this is two levels up rather than one (see createLiveFile).
+func runDirOf(livePath string) string {
+	return filepath.Dir(filepath.Dir(livePath))
+}
+
 // recordingWriter counts Write calls, which is the only way the live file's write
 // amplification is visible: the bytes on disk are identical either way.
 type recordingWriter struct {
@@ -923,7 +929,7 @@ func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
 
 	exportPath := retainedPath(cacheDir, outputID, ".a")
 	old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
-	for _, path := range []string{exportPath, filepath.Join(filepath.Dir(res.DiskPath), "run.lock")} {
+	for _, path := range []string{exportPath, filepath.Join(runDirOf(res.DiskPath), "run.lock")} {
 		if err := os.Chtimes(path, old, old); err != nil {
 			t.Fatal(err)
 		}
@@ -980,7 +986,7 @@ func TestRefreshingRetainedFileDoesNotKeepOldLiveRun(t *testing.T) {
 	st.close()
 
 	old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
-	if err := os.Chtimes(filepath.Join(filepath.Dir(first.DiskPath), "run.lock"), old, old); err != nil {
+	if err := os.Chtimes(filepath.Join(runDirOf(first.DiskPath), "run.lock"), old, old); err != nil {
 		t.Fatal(err)
 	}
 	expireMaintenanceStamps(t, filepath.Join(cacheDir, "v1"))
@@ -1591,7 +1597,7 @@ func retainedCache(t *testing.T, cfg config, outputID []byte) retainedPaths {
 	paths := retainedPaths{
 		export: retainedPath(cfg.dir, outputID, ".a"),
 		live:   res.DiskPath,
-		runDir: filepath.Dir(res.DiskPath),
+		runDir: runDirOf(res.DiskPath),
 	}
 	if _, err := os.Stat(paths.export); err != nil {
 		t.Fatalf("no retained export was produced: %v", err)
@@ -1680,6 +1686,125 @@ func TestSweepRemovesExpiredLiveRunWhileAnotherRunIsRegistered(t *testing.T) {
 	}
 	if _, err := os.Stat(paths.export); err != nil {
 		t.Fatalf("retained file was deleted while a run was registered: %v", err)
+	}
+}
+
+// A build materialises one live file per output it touches, and a large one was
+// measured at 28,000 in a single directory. At that fanout create and unlink cost
+// filesystem metadata and journal IO, not just lookups.
+func TestLiveFilesAreShardedWithinTheRunDir(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	shards := map[string]bool{}
+	for i := range 24 {
+		outputID := bytes.Repeat([]byte{byte(i + 1)}, 32)
+		res, err := st.put(request{
+			ID:       int64(i + 1),
+			Command:  cmdPut,
+			ActionID: bytes.Repeat([]byte{byte(200 - i)}, 32),
+			OutputID: outputID,
+			BodySize: 4,
+		}, bufio.NewReader(encodedBody([]byte("body"))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := runDirOf(res.DiskPath); got != st.runDir {
+			t.Fatalf("live file %q is not one shard inside %q", res.DiskPath, st.runDir)
+		}
+		// The shard has to come from the output ID, or a run dir full of one
+		// package's outputs would still land in one directory.
+		want := outputShard(hexOf(outputID))
+		if got := filepath.Base(filepath.Dir(res.DiskPath)); got != want {
+			t.Errorf("live file shard = %q, want %q", got, want)
+		}
+		shards[want] = true
+	}
+
+	entries, err := os.ReadDir(st.runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := 0
+	for _, entry := range entries {
+		if !entry.IsDir() && entry.Name() != "run.lock" {
+			files++
+		}
+	}
+	if files != 0 {
+		t.Errorf("%d live files sit directly in the run dir, want 0", files)
+	}
+	if len(shards) < 2 {
+		t.Errorf("24 distinct outputs produced %d shard(s); the split is not by output", len(shards))
+	}
+}
+
+// A run dir that retains an escaped path outlives its build, so it must not keep
+// the shards it no longer needs — 256 empty directories per retained run would
+// trade one metadata problem for another.
+func TestCloseLeavesNoEmptyShardsInARetainedRunDir(t *testing.T) {
+	t.Parallel()
+
+	cfg := config{dir: t.TempDir(), maxAge: defaultMaxAge, maxRetainedAge: time.Hour}
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// One archive, which escapes and is retained, so the run dir outlives close and
+	// keeps its shard. Then plain bodies in other shards, which do not escape and
+	// are removed — leaving those shards empty and nothing else to clear them.
+	archive := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 64))
+	kept, err := st.put(request{
+		ID: 1, Command: cmdPut,
+		ActionID: bytes.Repeat([]byte{129}, 32),
+		OutputID: bytes.Repeat([]byte{128}, 32),
+		BodySize: int64(len(archive)),
+	}, bufio.NewReader(encodedBody(archive)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		if _, err := st.put(request{
+			ID: int64(i + 2), Command: cmdPut,
+			ActionID: bytes.Repeat([]byte{byte(140 + i)}, 32),
+			OutputID: bytes.Repeat([]byte{byte(150 + i)}, 32),
+			BodySize: 4,
+		}, bufio.NewReader(encodedBody([]byte("body")))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runDir := st.runDir
+	st.close()
+
+	paths := retainedPaths{live: kept.DiskPath, runDir: runDir}
+	var empty []string
+	if err := filepath.WalkDir(paths.runDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() || path == paths.runDir {
+			return err
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			empty = append(empty, path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("retained run dir kept empty shards: %v", empty)
+	}
+	// And the escaped path itself is still there, still one shard deep.
+	if _, err := os.Stat(paths.live); err != nil {
+		t.Fatalf("pruning empty shards took the escaped path with it: %v", err)
 	}
 }
 

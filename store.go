@@ -497,40 +497,45 @@ func (st *store) unregisterRun() error {
 	return err
 }
 
+// prepareLiveRunForClose keeps the live files whose paths can escape this build and
+// removes the rest. Live files sit one shard deep (see createLiveFile), so this
+// walks rather than reading a single directory; empty shards go at the end, since a
+// retained run directory outlives the build and should not keep 256 of them.
 func (st *store) prepareLiveRunForClose() (bool, error) {
-	entries, err := os.ReadDir(st.runDir)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("read live run dir: %w", err)
-	}
-
 	retained := false
-	for _, entry := range entries {
-		if entry.Name() == "run.lock" {
-			continue
-		}
-		path := filepath.Join(st.runDir, entry.Name())
-		if !entry.Type().IsRegular() {
-			if err := os.RemoveAll(path); err != nil {
-				return false, fmt.Errorf("remove live path: %w", err)
+	err := filepath.WalkDir(st.runDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
 			}
-			continue
+			return fmt.Errorf("read live run dir: %w", err)
+		}
+		if d.IsDir() || d.Name() == "run.lock" {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			if err := os.RemoveAll(path); err != nil {
+				return fmt.Errorf("remove live path: %w", err)
+			}
+			return nil
 		}
 		stripped, err := st.stripLivePackageArchiveToExport(path)
 		if err != nil {
-			return false, err
+			return err
 		}
 		if stripped {
 			retained = true
-			continue
+			return nil
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return false, fmt.Errorf("remove live file: %w", err)
+			return fmt.Errorf("remove live file: %w", err)
 		}
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	return retained, nil
+	return retained, removeEmptyDirs(st.runDir)
 }
 
 func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
@@ -572,11 +577,7 @@ func liveOutputID(path string) string {
 }
 
 func (st *store) retainedDir(outputHex string) string {
-	shard := "xx"
-	if len(outputHex) >= 2 {
-		shard = outputHex[:2]
-	}
-	return filepath.Join(retainedRoot(st.versionDir), shard)
+	return filepath.Join(retainedRoot(st.versionDir), outputShard(outputHex))
 }
 
 func (st *store) retainedPath(outputHex, ext string) string {
