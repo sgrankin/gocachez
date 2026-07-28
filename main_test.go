@@ -4465,6 +4465,46 @@ func TestParseFlagsUsesEnvironmentOverrides(t *testing.T) {
 	}
 }
 
+// A command with no entry in rootHelp is undiscoverable, and one with no case in
+// writeHelp answers -h with the root text, which does not mention it. Both stayed
+// green through a whole release of -max-retained-age being missing from the help,
+// so pin them the way the flags are pinned.
+func TestRootHelpDocumentsEveryCommand(t *testing.T) {
+	t.Parallel()
+
+	listed := map[string]bool{}
+	inCommands := false
+	for line := range strings.SplitSeq(rootHelp, "\n") {
+		if strings.HasPrefix(line, "Commands:") {
+			inCommands = true
+			continue
+		}
+		if inCommands {
+			if strings.TrimSpace(line) == "" {
+				break
+			}
+			name, _, _ := strings.Cut(strings.TrimSpace(line), " ")
+			listed[name] = true
+		}
+	}
+
+	for _, mode := range runModes {
+		if !listed[string(mode)] {
+			t.Errorf("%q is accepted but not listed under Commands in rootHelp", mode)
+		}
+		var help bytes.Buffer
+		if err := writeHelp(&help, mode); err != nil {
+			t.Fatal(err)
+		}
+		if help.String() == rootHelp {
+			t.Errorf("%q has no help text of its own; -h falls through to rootHelp", mode)
+		}
+		if !strings.Contains(help.String(), "gocachez "+string(mode)) {
+			t.Errorf("%q help does not show its own usage line: %q", mode, help.String())
+		}
+	}
+}
+
 func TestRootHelpListsEveryFlag(t *testing.T) {
 	t.Parallel()
 

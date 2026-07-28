@@ -8,11 +8,12 @@ old compressed entries automatically.
 This project was inspired by the discussion on
 [`golang/go#76337`](https://github.com/golang/go/issues/76337).
 
-This is a fork of [`jakebailey/gocachez`](https://github.com/jakebailey/gocachez).
-It adds a separate expiry for retained `go list` files, and changes maintenance so
-that a build never waits for it: the scan is rate-limited, skips rather than
-queues when another process holds the cache, and does its analysis without the
-lock that a starting build needs.
+This is a fork of
+[`jakebailey/gocachez`](https://github.com/jakebailey/gocachez). It adds a
+separate expiry for retained `go list` files, and changes maintenance so that a
+build never waits for it: the scan is rate-limited, skips rather than queues
+when another process holds the cache, and does its analysis without the lock
+that a starting build needs.
 
 Go `std`:
 
@@ -67,6 +68,17 @@ $ gocachez clean
 
 `clean` removes blobs, live files, and catalog state that no active `gocachez`
 process is using. State for active live runs is preserved.
+
+Run maintenance now:
+
+```console
+$ gocachez prune
+```
+
+`prune` does the work that otherwise happens as a build's helper exits, without
+waiting for the interval. It enforces `maxSize` and `maxAge` and reclaims unused
+live run directories; it never removes anything a build might still be using.
+Unlike `clean`, it does not empty the cache.
 
 Show cache state:
 
@@ -171,8 +183,8 @@ This budgets the compressed blobs only — the figure `gocachez status` reports 
 "Blob max usage". Retained `go list` files are **not** counted against it; they
 are reclaimed by `maxAge`, and by following their blob when it is evicted. They
 are stored uncompressed, so on a cache of mostly Go package archives they can
-approach the size of the blobs themselves: check "Total stored" in `gocachez
-status` for what is actually on disk.
+approach the size of the blobs themselves. For what is actually on disk, check
+the "Total stored" figure reported by `gocachez status`.
 
 **Maximum age of unused entries**
 
@@ -193,16 +205,16 @@ status` for what is actually on disk.
 Retained files are not cache entries — they exist only so that paths which
 escaped a finished build stay openable (see above). Losing one costs a re-strip
 the next time its output is used, whereas losing a blob costs a rebuild, so they
-are usually worth expiring far sooner than the cache itself. On a cache with high
-key churn every rebuild of a package mints another one, and by default they all
-linger for `maxAge`; that tail can rival the blobs in size.
+are usually worth expiring far sooner than the cache itself. On a cache with
+high key churn every rebuild of a package mints another one, and by default they
+all linger for `maxAge`; that tail can rival the blobs in size.
 
 Set this to roughly how long a tool might hold a path from `go list` after the
 build that produced it finished. For CI, that is the length of a job. Locally it
 is the length of an editor session, because `go/packages` consumers such as
 `gopls` and `golangci-lint` can hold an `Export` path for as long as they run —
-which is why the default leaves the previous behaviour alone. A file still in use
-is safe: its mtime is refreshed as builds touch it, and the cutoff allows a
+which is why the default leaves the previous behaviour alone. A file still in
+use is safe: its mtime is refreshed as builds touch it, and the cutoff allows a
 further `mtimeInterval` (1h) of slack on top of the configured age, so `1h`
 expires at about two.
 
@@ -219,12 +231,21 @@ them exactly buys nothing.
 
 Both limits are enforced by a maintenance scan that runs at most once an hour,
 and only when no build is using the cache — the scan is proportional to the size
-of the cache, and the `go` command waits for `gocachez` to exit, so running it on
-every build would add that cost to every build. `maxSize` is therefore a target
-rather than a hard cap: the cache can exceed it between scans. A single build
-that writes a large fraction of `maxSize` scans on its way out instead of waiting
-for the next interval, but many smaller builds can still drift past the limit
-until the next scan brings the cache back under it.
+of the cache, and the `go` command waits for `gocachez` to exit, so running it
+on every build would add that cost to every build. `maxSize` is therefore a
+target rather than a hard cap: the cache can exceed it between scans. A single
+build that writes a large fraction of `maxSize` scans on its way out instead of
+waiting for the next interval, but many smaller builds can still drift past the
+limit until the next scan brings the cache back under it. `gocachez prune` runs
+the scan on request, which is how to keep even that cost off a build.
+
+Reclaiming live run directories is separate, and waits only for the hourly
+interval. Each one is guarded by its own lock rather than by the whole cache
+being idle, so unlike the scan it still happens on a machine where builds
+overlap continuously. Every clean exit that retains a `go list` path leaves its
+directory behind on purpose, so they arrive at the rate of `go` invocations, and
+the tree holds roughly `maxRetainedAge` plus the hour of mtime slack plus one
+interval worth of them.
 
 **Verbose maintenance logs**
 
@@ -244,8 +265,8 @@ until the next scan brings the cache back under it.
 
 CI differs from local use in three ways that change the right settings: nothing
 holds a `go list` path for longer than a job, the cache is usually archived and
-restored between runs, and several `go` commands may share one cache directory at
-once.
+restored between runs, and several `go` commands may share one cache directory
+at once.
 
 ### Installing the helper
 
@@ -257,24 +278,25 @@ $ go get -tool github.com/sgrankin/gocachez
 $ go install github.com/sgrankin/gocachez
 ```
 
-Inside a module `go install` takes no `@version`: it uses that module's `go.mod`,
-which is what makes the pin meaningful. The tradeoff is that gocachez's
-dependencies land in your `go.sum` as indirect requirements. To keep them out,
-install a pinned version standalone instead — from anywhere:
+Inside a module `go install` takes no `@version`: it uses that module's
+`go.mod`, which is what makes the pin meaningful. The tradeoff is that
+gocachez's dependencies land in your `go.sum` as indirect requirements. To keep
+them out, install a pinned version standalone instead — from anywhere:
 
 ```console
 $ go install github.com/sgrankin/gocachez@v0.0.0-...
 ```
 
-Then point the `go` command at the installed binary. In CI prefer the environment
-variable over `go env -w`, which persists to the user's environment file:
+Then point the `go` command at the installed binary. In CI prefer the
+environment variable over `go env -w`, which persists to the user's environment
+file:
 
 ```console
 $ export GOCACHEPROG="$(go env GOPATH)/bin/gocachez -config /path/to/gocachez.json"
 ```
 
-`GOCACHEPROG` is a command line, not just a path, so flags can go here instead of
-a config file. Two things to get right:
+`GOCACHEPROG` is a command line, not just a path, so flags can go here instead
+of a config file. Two things to get right:
 
 - Install before exporting `GOCACHEPROG`, or the build that installs the helper
   goes looking for a helper that does not exist yet. `GOBIN` is empty unless you
@@ -292,9 +314,9 @@ $ gocachez -h | grep max-retained-age
 
 ```json
 {
-  "maxSize": "250GiB",
-  "maxAge": "5d",
-  "maxRetainedAge": "1h"
+    "maxSize": "250GiB",
+    "maxAge": "5d",
+    "maxRetainedAge": "1h"
 }
 ```
 
@@ -320,10 +342,11 @@ Archive `v1/blobs/` and `v1/cache.db*`. Exclude these:
   time each is touched, and saves archiving an uncompressed copy of every
   package's export data.
 - `v1/live/` — scratch space for one `GOCACHEPROG` process, keyed by a run
-  directory no later run can use. After a clean exit it holds only the hard links
-  that keep escaped `go list` paths alive, sharing inodes with `v1/retained/`, so
-  an archiver that does not preserve hard links stores that data twice. After a
-  killed process it can also hold full uncompressed artifacts.
+  directory no later run can use. After a clean exit it holds only the hard
+  links that keep escaped `go list` paths alive, sharing inodes with
+  `v1/retained/`, so an archiver that does not preserve hard links stores that
+  data twice. After a killed process it can also hold full uncompressed
+  artifacts.
 
 Both are recreated as needed, so restoring without them is safe — verified by
 archiving only `v1/blobs/` and `v1/cache.db`, restoring, and getting hits on
@@ -336,12 +359,32 @@ cache — the normal state between CI steps — it removes the blobs, the retain
 tree, and the catalog. That is the whole cache. Use it to reset a cache, never
 before archiving one.
 
-Nothing else is needed between runs: maintenance happens automatically as
-processes exit.
+`gocachez prune` is the command for that job. It enforces the limits and
+reclaims unused live run directories, and leaves the cache usable.
+
+### Optionally, prune as its own step
+
+Nothing is required between runs — maintenance happens as processes exit. But
+the `go` command waits for its helper to exit, so that work is charged to
+whichever build happens to trigger it. Running it deliberately moves the cost
+somewhere it does not matter:
+
+```console
+$ gocachez prune -config /path/to/gocachez.json
+```
+
+Best placed after the last `go` command in a job and before archiving, so the
+archive is of a cache already under its limits. It reports on stdout if builds
+are still registered, in which case it reclaims live run directories and leaves
+the blobs alone; add `-v` to log what it removed. It exits 0 either way, so it
+will not fail a job for being unable to do the full pass.
 
 ### Concurrency
 
 Several `go` commands can share one cache directory. Each `gocachez` process
-registers a run, and maintenance only deletes while none are registered, so
-parallel jobs neither corrupt the cache nor block each other — the expensive part
-of a maintenance scan runs without the lock that a starting process needs.
+registers a run, and blobs and catalog entries are only ever deleted while none
+are registered, so parallel jobs neither corrupt the cache nor block each other
+— the expensive part of a maintenance scan runs without the lock that a starting
+process needs. Live run directories are held by a lock of their own instead, so
+reclaiming them does not wait for the cache to fall idle, which on a busy
+machine it may never do.

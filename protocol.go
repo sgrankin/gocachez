@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -171,8 +172,12 @@ func stdoutIsTerminal(stdout io.Writer) bool {
 	return ok && term.IsTerminal(int(f.Fd()))
 }
 
+// runModes lists every command, so that adding one cannot silently leave
+// isRunMode or the help text behind.
+var runModes = []runMode{runModeClean, runModePrune, runModeStatus}
+
 func isRunMode(arg string) bool {
-	return arg == string(runModeClean) || arg == string(runModePrune) || arg == string(runModeStatus)
+	return slices.Contains(runModes, runMode(arg))
 }
 
 func startProfiling(cfg config) (func() error, error) {
