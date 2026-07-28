@@ -17,11 +17,16 @@ import (
 )
 
 type cacheStatus struct {
-	cacheDir         string
-	maxSize          int64
-	maxAge           time.Duration
-	maxRetainedAge   time.Duration
-	verbose          bool
+	cacheDir       string
+	maxSize        int64
+	maxAge         time.Duration
+	maxRetainedAge time.Duration
+	verbose        bool
+	// types records whether the breakdown was asked for. Without it the type
+	// tables are not printed at all, rather than printed empty: a table of zeros
+	// says the cache holds nothing of any type, which is a different claim from
+	// not having looked.
+	types            bool
 	versionDir       string
 	catalogExists    bool
 	catalog          catalogStatus
@@ -129,6 +134,9 @@ func writeStatus(cfg config, w io.Writer) error {
 	}); err != nil {
 		return err
 	}
+	if !status.types {
+		return nil
+	}
 	if err := writeBlobTypeStatus(w, status.blobTypes); err != nil {
 		return err
 	}
@@ -157,6 +165,7 @@ func readStatus(cfg config) (cacheStatus, error) {
 		maxAge:         cfg.maxAge,
 		maxRetainedAge: cfg.retainedAge(),
 		verbose:        cfg.verbose,
+		types:          cfg.types,
 		versionDir:     versionDir,
 	}
 	if _, err := os.Stat(versionDir); errors.Is(err, os.ErrNotExist) {

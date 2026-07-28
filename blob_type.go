@@ -74,8 +74,7 @@ func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
 // breakdown, decompressing only blobs without a current cached classification
 // and caching any it computes.
 func blobTypeStatuses(dbPath, blobsDir string, outputs []catalogOutput, verbose bool) []blobTypeStatus {
-	byKind, classified := classifyBlobTypes(blobsDir, outputs)
-	persistClassifications(dbPath, blobClassifier, classified, verbose)
+	byKind := classifyBlobTypes(dbPath, blobsDir, outputs, verbose)
 
 	statuses := make([]blobTypeStatus, 0, len(byKind))
 	for _, status := range byKind {
@@ -99,7 +98,7 @@ type blobTypeResult struct {
 // carrying a cached classification (blobType) reuse it; the rest are
 // decompressed and classified in parallel, and returned so the caller can cache
 // them.
-func classifyBlobTypes(blobsDir string, outputs []catalogOutput) (map[blobTypeKind]*blobTypeStatus, map[string]blobTypeKind) {
+func classifyBlobTypes(dbPath, blobsDir string, outputs []catalogOutput, verbose bool) map[blobTypeKind]*blobTypeStatus {
 	byKind := make(map[blobTypeKind]*blobTypeStatus)
 	classified := make(map[string]blobTypeKind)
 
@@ -112,7 +111,7 @@ func classifyBlobTypes(blobsDir string, outputs []catalogOutput) (map[blobTypeKi
 		pending = append(pending, output)
 	}
 	if len(pending) == 0 {
-		return byKind, classified
+		return byKind
 	}
 
 	workers := min(len(pending), min(max(runtime.GOMAXPROCS(0), 1), 8))
@@ -148,14 +147,23 @@ func classifyBlobTypes(blobsDir string, outputs []catalogOutput) (map[blobTypeKi
 		close(results)
 	}()
 
+	// Persist in batches as results arrive. Writing only at the end meant a status
+	// that was killed first — a 30s timeout against a cache of a quarter million
+	// outputs — cached nothing, so every later run repeated the whole pass and it
+	// never got cheaper.
 	for result := range results {
 		kind := result.classification.kind
 		addBlobType(byKind, kind, result.output)
 		if kind != blobTypeUnreadable {
 			classified[result.output.outputID] = kind
 		}
+		if len(classified) >= classificationBatch {
+			persistClassifications(dbPath, blobClassifier, classified, verbose)
+			classified = make(map[string]blobTypeKind)
+		}
 	}
-	return byKind, classified
+	persistClassifications(dbPath, blobClassifier, classified, verbose)
+	return byKind
 }
 
 func addBlobType(byKind map[blobTypeKind]*blobTypeStatus, kind blobTypeKind, output catalogOutput) {

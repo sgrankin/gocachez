@@ -410,6 +410,100 @@ func TestStatusDoesNotReadBlobsWithoutTypes(t *testing.T) {
 	}
 }
 
+// Without -types the type sections must be absent, not empty. A table reading
+// "None 0 0B" says the cache holds nothing of any type, which is a different claim
+// from not having looked — and on a cache of a quarter million blobs it is a
+// wrong one.
+func TestStatusOmitsTypeSectionsWithoutTypes(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.put(request{
+		ID: 1, Command: cmdPut,
+		ActionID: bytes.Repeat([]byte{95}, 32),
+		OutputID: bytes.Repeat([]byte{96}, 32),
+		BodySize: 4,
+	}, bufio.NewReader(encodedBody([]byte("body")))); err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	var stdout bytes.Buffer
+	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	for _, unwanted := range []string{"Compressed blob contents", "Retained go-list files:\n"} {
+		if strings.Contains(stdout.String(), unwanted) {
+			t.Errorf("status printed %q without -types:\n%s", unwanted, stdout.String())
+		}
+	}
+	// The storage numbers still have to be there — that is what the report is for.
+	if !strings.Contains(stdout.String(), "Compressed cache blobs") {
+		t.Errorf("status dropped the storage figures too:\n%s", stdout.String())
+	}
+}
+
+// Classifications were written only after the whole pass finished, so a status that
+// ran out of time cached nothing and the next one repeated all of it — which is why
+// a cache that had been status-ed many times still reported no types at all.
+func TestClassificationSurvivesAnIncompletePass(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// More outputs than one batch, so persistence has to happen mid-pass.
+	outputs := classificationBatch + 20
+	for i := range outputs {
+		action := sha256.Sum256(fmt.Appendf(nil, "cls-action-%d", i))
+		output := sha256.Sum256(fmt.Appendf(nil, "cls-output-%d", i))
+		if _, err := st.put(request{
+			ID: int64(i), Command: cmdPut,
+			ActionID: action[:], OutputID: output[:], BodySize: 4,
+		}, bufio.NewReader(encodedBody([]byte("body")))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	versionDir := st.versionDir
+	st.close()
+
+	dbPath := filepath.Join(versionDir, "cache.db")
+	classified := func() int {
+		db, err := openExistingDB(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close() //nolint:errcheck
+		var n int
+		if err := db.QueryRowContext(context.Background(),
+			`SELECT COUNT(*) FROM entries WHERE blob_type IS NOT NULL`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if got := classified(); got != 0 {
+		t.Fatalf("%d entries classified before any status ran", got)
+	}
+
+	_, _, outs, err := readCatalogStatus(dbPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobTypeStatuses(dbPath, filepath.Join(versionDir, "blobs"), outs, false)
+
+	// Batched writes mean progress is on disk, not held until the end.
+	if got := classified(); got < classificationBatch {
+		t.Errorf("%d entries classified, want at least one full batch (%d) persisted",
+			got, classificationBatch)
+	}
+}
+
 // The scan enforces maxSize and maxAge, declines while any build is registered, and
 // stamps nothing when it declines — so whether it has ever completed is the
 // difference between the limits applying and being ignored. That was invisible in
@@ -3959,7 +4053,7 @@ func TestRunStatusEmptyCache(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	var stdout bytes.Buffer
-	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+	if err := run([]string{"status", "-types", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
 		t.Fatal(err)
 	}
 	got := stdout.String()
