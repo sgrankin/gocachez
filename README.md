@@ -86,7 +86,19 @@ Show cache state:
 $ gocachez status
 ```
 
-`status` reports the current cache configuration and state.
+`status` reports the current cache configuration and state, including when each
+maintenance pass last completed. It reads only the catalog and the directory
+entries, so its cost does not depend on how much is stored.
+
+Add `-types` for a breakdown of what the cache holds by kind:
+
+```console
+$ gocachez status -types
+```
+
+That one opens every blob it has no cached classification for, so on a large
+cache it reads the whole thing. The classifications are cached in the catalog,
+so a second run is much cheaper than the first.
 
 ## How it works
 

@@ -56,6 +56,8 @@ Flags:
   -max-retained-age dur   maximum age of unused retained go-list files; 0 or
                           unset follows -max-age
   -v                      log cache maintenance to stderr
+  -types                  status: break down contents by type; reads every
+                          blob, so it is slow on a large cache
   -h                      show help
 `
 
@@ -101,5 +103,7 @@ Show cache state without modifying it.
 Flags:
   -config path  JSON config file
   -dir path     cache directory
+  -types        break down contents by type; reads every blob it has no cached
+                classification for, so it is slow on a large cache
   -h            show help
 `

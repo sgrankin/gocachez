@@ -32,6 +32,17 @@ type cacheStatus struct {
 	retainedTypes    []retainedTypeStatus
 	activeLiveRuns   int64
 	inactiveLiveRuns int64
+	// lastScan and lastSweep are how long ago each maintenance pass completed,
+	// and whether it ever has. The scan declines while any build is registered
+	// and stamps nothing when it does, so on a busy host an absent scan stamp is
+	// the difference between limits being enforced and being ignored.
+	lastScan  stamp
+	lastSweep stamp
+}
+
+type stamp struct {
+	age   time.Duration
+	found bool
 }
 
 type catalogStatus struct {
@@ -65,6 +76,17 @@ type retainedTypeStatus struct {
 	size  int64
 }
 
+// formatStamp says how long ago a pass completed. "never" is not cosmetic: the scan
+// enforces maxSize and maxAge, declines while any build is registered, and stamps
+// nothing when it declines, so never having completed means neither limit is being
+// applied.
+func formatStamp(st stamp) string {
+	if !st.found {
+		return "never"
+	}
+	return formatAge(st.age) + " ago"
+}
+
 func writeStatus(cfg config, w io.Writer) error {
 	status, err := readStatus(cfg)
 	if err != nil {
@@ -91,6 +113,8 @@ func writeStatus(cfg config, w io.Writer) error {
 		{"Cached outputs", formatInt(status.catalog.outputs)},
 		{"Oldest cache entry", formatOldestAccess(status.catalog, time.Now())},
 		{"Live runs", formatLiveRuns(status.activeLiveRuns, status.inactiveLiveRuns)},
+		{"Last scan", formatStamp(status.lastScan)},
+		{"Last sweep", formatStamp(status.lastSweep)},
 	}); err != nil {
 		return err
 	}
@@ -144,18 +168,24 @@ func readStatus(cfg config) (cacheStatus, error) {
 	var err error
 	dbPath := filepath.Join(versionDir, "cache.db")
 	var outputs []catalogOutput
-	status.catalogExists, status.catalog, outputs, err = readCatalogStatus(dbPath)
+	status.catalogExists, status.catalog, outputs, err = readCatalogStatus(dbPath, cfg.types)
 	if err != nil {
 		return cacheStatus{}, err
 	}
 	// Blob file count matches the number of cached outputs, so derive it
 	// from the catalog instead of walking the blobs directory.
 	status.blobFiles = status.catalog.outputs
-	status.blobTypes = blobTypeStatuses(dbPath, blobsDir, outputs, cfg.verbose)
-	status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs, cfg.verbose)
+	if cfg.types {
+		status.blobTypes = blobTypeStatuses(dbPath, blobsDir, outputs, cfg.verbose)
+	}
+	status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(
+		dbPath, retainedRoot(versionDir), outputs, cfg.types, cfg.verbose,
+	)
 	if err != nil {
 		return cacheStatus{}, err
 	}
+	status.lastScan = stampAge(pruneStampPath(versionDir))
+	status.lastSweep = stampAge(sweepStampPath(versionDir))
 	status.activeLiveRuns, status.inactiveLiveRuns, err = readLiveStatus(liveRoot)
 	if err != nil {
 		return cacheStatus{}, err
@@ -167,7 +197,10 @@ func readStatus(cfg config) (cacheStatus, error) {
 // plus the per-output rows. It performs a single GROUP BY output_id scan
 // (listOutputs) to derive the output count, sizes, and cached blob types, so
 // callers can reuse outputs for the blob-type breakdown without rescanning.
-func readCatalogStatus(dbPath string) (bool, catalogStatus, []catalogOutput, error) {
+// readCatalogStatus totals the catalog, and returns the per-output rows only when
+// withTypes is set. Those rows exist solely to feed classification, and listing
+// them on a large cache costs more than every aggregate here put together.
+func readCatalogStatus(dbPath string, withTypes bool) (bool, catalogStatus, []catalogOutput, error) {
 	if !regularFile(dbPath) {
 		return false, catalogStatus{}, nil, nil
 	}
@@ -198,23 +231,26 @@ func readCatalogStatus(dbPath string) (bool, catalogStatus, []catalogOutput, err
 	}
 
 	q := newCatalog(db)
-	hasBlobType, err := entriesHasColumn(ctx, db, "blob_type_version")
+	status.outputs, status.size, status.compressedSize, err = q.outputStats(ctx)
 	if err != nil {
-		return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
+		return false, catalogStatus{}, nil, fmt.Errorf("total catalog outputs: %w", err)
 	}
-	hasRetainedType, err := entriesHasColumn(ctx, db, "retained_type_version")
-	if err != nil {
-		return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
+
+	var outputs []catalogOutput
+	if withTypes {
+		hasBlobType, err := entriesHasColumn(ctx, db, "blob_type_version")
+		if err != nil {
+			return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
+		}
+		hasRetainedType, err := entriesHasColumn(ctx, db, "retained_type_version")
+		if err != nil {
+			return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
+		}
+		outputs, err = q.listOutputs(ctx, hasBlobType, blobClassifierVersion, hasRetainedType, retainedClassifierVersion)
+		if err != nil {
+			return false, catalogStatus{}, nil, fmt.Errorf("list catalog outputs: %w", err)
+		}
 	}
-	outputs, err := q.listOutputs(ctx, hasBlobType, blobClassifierVersion, hasRetainedType, retainedClassifierVersion)
-	if err != nil {
-		return false, catalogStatus{}, nil, fmt.Errorf("list catalog outputs: %w", err)
-	}
-	for _, output := range outputs {
-		status.size += output.size
-		status.compressedSize += output.compressedSize
-	}
-	status.outputs = int64(len(outputs))
 
 	status.runs, err = q.countRuns(ctx)
 	if err != nil {
@@ -429,7 +465,11 @@ func formatAge(age time.Duration) string {
 	}
 }
 
-func readRetainedStatus(dbPath, root string, outputs []catalogOutput, verbose bool) (int64, int64, []retainedTypeStatus, error) {
+// readRetainedStatus counts and measures the retained tree, and breaks it down by
+// type only when asked. The count and the size come from the directory entries; the
+// breakdown reads every retained Go source it has no cached classification for,
+// which is the part worth not paying for by default.
+func readRetainedStatus(dbPath, root string, outputs []catalogOutput, withTypes, verbose bool) (int64, int64, []retainedTypeStatus, error) {
 	byKind := make(map[retainedTypeKind]*retainedTypeStatus)
 	cached := make(map[string]retainedTypeKind)
 	for _, output := range outputs {
@@ -443,6 +483,11 @@ func readRetainedStatus(dbPath, root string, outputs []catalogOutput, verbose bo
 		info, err := d.Info()
 		if err != nil {
 			return fmt.Errorf("stat retained file: %w", err)
+		}
+		files++
+		size += info.Size()
+		if !withTypes {
+			return nil
 		}
 		outputID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 		kind, ok := cached[outputID]
@@ -463,8 +508,6 @@ func readRetainedStatus(dbPath, root string, outputs []catalogOutput, verbose bo
 		}
 		status.count++
 		status.size += info.Size()
-		files++
-		size += info.Size()
 		return nil
 	}
 
@@ -512,6 +555,17 @@ func retainedFileKind(path string) retainedTypeKind {
 		}
 	}
 	return retainedTypeOther
+}
+
+// stampAge reports how long ago a maintenance pass last completed. A missing stamp
+// means it has not completed at all — which is the interesting case, since the scan
+// declines whenever a build is registered and writes nothing when it does.
+func stampAge(path string) stamp {
+	info, err := os.Stat(path)
+	if err != nil {
+		return stamp{}
+	}
+	return stamp{age: time.Since(info.ModTime()), found: true}
 }
 
 func readLiveStatus(liveRoot string) (int64, int64, error) {

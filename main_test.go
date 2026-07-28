@@ -360,6 +360,90 @@ func runDirOf(livePath string) string {
 	return filepath.Dir(filepath.Dir(livePath))
 }
 
+// The type breakdown reads every blob it has no cached classification for. On a
+// cache of 174 GiB across 267,900 outputs that is the report's entire cost, and it
+// is a diagnostic rather than something you need to see the cache's size — so the
+// default must not touch a blob. Deleting one is the cheapest way to prove it: any
+// pass that opens blobs fails, and one that only reads the catalog does not.
+func TestStatusDoesNotReadBlobsWithoutTypes(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputID := bytes.Repeat([]byte{93}, 32)
+	if _, err := st.put(request{
+		ID: 1, Command: cmdPut,
+		ActionID: bytes.Repeat([]byte{94}, 32),
+		OutputID: outputID,
+		BodySize: 4,
+	}, bufio.NewReader(encodedBody([]byte("body")))); err != nil {
+		t.Fatal(err)
+	}
+	blobPath := st.blobPath(hexOf(outputID))
+	st.close()
+	if err := os.Remove(blobPath); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	// The catalog still counts it, so the report is complete without the blob.
+	if !strings.Contains(stdout.String(), "Cached outputs") {
+		t.Fatalf("status did not report the catalog: %q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "Unreadable blobs") {
+		t.Error("status classified blobs without -types")
+	}
+
+	// With -types it does open them, and says so about the one that is gone.
+	stdout.Reset()
+	if err := run([]string{"status", "-types", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "Unreadable blobs") {
+		t.Errorf("-types did not classify blobs: %q", stdout.String())
+	}
+}
+
+// The scan enforces maxSize and maxAge, declines while any build is registered, and
+// stamps nothing when it declines — so whether it has ever completed is the
+// difference between the limits applying and being ignored. That was invisible in
+// the report, and answering it meant stat-ing a file by hand.
+func TestStatusReportsWhetherMaintenanceHasRun(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Registered, so the scan declines and leaves no stamp — the busy-host case.
+	var stdout bytes.Buffer
+	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "Last scan           never") {
+		t.Errorf("status did not report a scan that has never run: %q", stdout.String())
+	}
+	st.close()
+
+	// Closing stamps both passes on an idle cache.
+	stdout.Reset()
+	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Last scan           <1m ago", "Last sweep          <1m ago"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("status output missing %q: %q", want, stdout.String())
+		}
+	}
+}
+
 // recordingWriter counts Write calls, which is the only way the live file's write
 // amplification is visible: the bytes on disk are identical either way.
 type recordingWriter struct {
@@ -3881,7 +3965,7 @@ func TestRunStatusInactiveCache(t *testing.T) {
 	st.close()
 
 	var stdout bytes.Buffer
-	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+	if err := run([]string{"status", "-types", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
 		t.Fatal(err)
 	}
 	got := stdout.String()
@@ -4059,7 +4143,7 @@ func TestRunStatusActiveCache(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+	if err := run([]string{"status", "-types", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
 		t.Fatal(err)
 	}
 	got := stdout.String()
@@ -4111,7 +4195,7 @@ func TestRunStatusShowsBlobTypes(t *testing.T) {
 	st.close()
 
 	var stdout bytes.Buffer
-	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+	if err := run([]string{"status", "-types", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
 		t.Fatal(err)
 	}
 	got := stdout.String()
@@ -4158,7 +4242,7 @@ func TestRunStatusShowsRetainedFileTypes(t *testing.T) {
 	st.close()
 
 	var stdout bytes.Buffer
-	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+	if err := run([]string{"status", "-types", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
 		t.Fatal(err)
 	}
 	got := stdout.String()
@@ -4196,7 +4280,7 @@ func TestRunStatusCountsUnreadableBlobTypes(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+	if err := run([]string{"status", "-types", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
 		t.Fatal(err)
 	}
 	got := stdout.String()
@@ -4407,11 +4491,11 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 
 	// Simulate an older cache and verify status backfills its classification.
 	execCatalog(t, dbPath, `UPDATE entries SET retained_type = NULL, retained_type_version = NULL WHERE output_id = ?`, outputHex)
-	_, _, outputs, err := readCatalogStatus(dbPath)
+	_, _, outputs, err := readCatalogStatus(dbPath, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, statuses, err := readRetainedStatus(dbPath, retainedRoot(versionDir), outputs, false)
+	_, _, statuses, err := readRetainedStatus(dbPath, retainedRoot(versionDir), outputs, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4431,11 +4515,11 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 	if err := os.WriteFile(retainedPath, []byte("// Code generated by 'go test'. DO NOT EDIT.\n\npackage main\n"), 0o666); err != nil {
 		t.Fatal(err)
 	}
-	_, _, outputs, err = readCatalogStatus(dbPath)
+	_, _, outputs, err = readCatalogStatus(dbPath, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, statuses, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs, false)
+	_, _, statuses, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}

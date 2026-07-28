@@ -63,7 +63,7 @@ type blobClassification struct {
 }
 
 func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
-	_, _, outputs, err := readCatalogStatus(dbPath)
+	_, _, outputs, err := readCatalogStatus(dbPath, true)
 	if err != nil {
 		return nil, err
 	}

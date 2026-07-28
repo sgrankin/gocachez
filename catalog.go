@@ -278,6 +278,24 @@ FROM (
 // classification (blobType), but only for entries classified at
 // classifierVersion; classifications from older versions are treated as absent
 // so they get recomputed. blobType is only available on migrated caches.
+// outputStats totals what status reports without materialising a row per output.
+// It mirrors listOutputs' grouping — one row per output_id, taking MAX of each
+// size — because several actions can map to one output and its bytes are on disk
+// once. A cache with 267,900 outputs was loading all of them to add up two
+// columns.
+func (c *catalog) outputStats(ctx context.Context) (int64, int64, int64, error) {
+	var count, size, compressedSize int64
+	err := c.db.QueryRowContext(ctx, `
+SELECT COUNT(*),
+       CAST(COALESCE(SUM(size), 0) AS INTEGER),
+       CAST(COALESCE(SUM(compressed_size), 0) AS INTEGER)
+FROM (
+	SELECT MAX(size) AS size, MAX(compressed_size) AS compressed_size
+	FROM entries GROUP BY output_id
+)`).Scan(&count, &size, &compressedSize)
+	return count, size, compressedSize, err
+}
+
 func (c *catalog) listOutputs(
 	ctx context.Context,
 	includeBlobType bool,

@@ -27,8 +27,12 @@ type config struct {
 	// retainedAge, not directly.
 	maxRetainedAge time.Duration
 	verbose        bool
-	cpuProfile     string
-	memProfile     string
+	// types asks status for the per-type breakdown, which reads every blob and
+	// retained source file it has no cached classification for. On a large cache
+	// that is the whole cache, so it is off by default.
+	types      bool
+	cpuProfile string
+	memProfile string
 }
 
 // retainedAge reports when retained files expire: maxRetainedAge if it was set,
@@ -82,6 +86,7 @@ type rawFlags struct {
 	maxAge         string
 	maxRetainedAge string
 	verbose        bool
+	types          bool
 	cpuProfile     string
 	memProfile     string
 }
@@ -96,6 +101,7 @@ func bindFlags(fs *flag.FlagSet, raw *rawFlags) {
 	fs.StringVar(&raw.maxAge, "max-age", "", "maximum age of unused entries, or 0 to disable age-based pruning")
 	fs.StringVar(&raw.maxRetainedAge, "max-retained-age", "", "maximum age of unused retained go-list files; 0 or unset follows -max-age")
 	fs.BoolVar(&raw.verbose, "v", false, "log cache maintenance to stderr")
+	fs.BoolVar(&raw.types, "types", false, "status: break down contents by type, reading every blob to do so")
 	fs.StringVar(&raw.cpuProfile, "cpuprofile", "", "write CPU profile to file")
 	fs.StringVar(&raw.memProfile, "memprofile", "", "write memory profile to file")
 }
@@ -120,6 +126,7 @@ func parseFlagOperands(args []string) (config, []string, error) {
 	configPath = raw.configPath
 	flagDir, flagMaxSize, flagMaxAge, flagMaxRetainedAge := raw.dir, raw.maxSize, raw.maxAge, raw.maxRetainedAge
 	flagVerbose := raw.verbose
+	cfg.types = raw.types
 	cfg.cpuProfile, cfg.memProfile = raw.cpuProfile, raw.memProfile
 
 	visited := map[string]bool{}
