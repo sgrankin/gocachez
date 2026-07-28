@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"runtime"
 	"runtime/pprof"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -107,18 +109,37 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 	if err != nil {
 		return err
 	}
-	defer st.close()
+	var closeOnce sync.Once
+	closeStore := func() { closeOnce.Do(st.close) }
+	defer closeStore()
 
 	br := bufio.NewReader(stdin)
 	var wg sync.WaitGroup
+	// serving is held while a request is being handled, so a shutdown can wait for
+	// one to finish rather than strip the live files it is still writing.
+	var serving sync.Mutex
 	sem := make(chan struct{}, min(max(runtime.GOMAXPROCS(0), 1), 8))
+
+	// Only the real helper takes over process-wide signals. A test passes its own
+	// reader, and must not have a stray SIGTERM reach an os.Exit(0) that would end
+	// the test binary looking successful.
+	if stdin == os.Stdin {
+		stopSignals := shutdownOnSignal(&serving, &wg, closeStore)
+		defer stopSignals()
+	}
+
 	for {
 		req, err := readRequest(br)
-		if errors.Is(err, io.EOF) {
+		// A closed stdin is the end of the input, not a failure: it is how the go
+		// command shuts a helper down.
+		if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
 			wg.Wait()
 			return rw.err()
 		}
 		if err != nil {
+			// In-flight gets are still materialising into the run directory that
+			// the deferred close is about to strip.
+			wg.Wait()
 			return err
 		}
 
@@ -136,10 +157,54 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 			}
 			return rw.err()
 		default:
-			if err := rw.write(st.handle(req, br)); err != nil {
+			// Under serving, because a put streams into a live file that a
+			// shutdown would otherwise strip out from under it.
+			serving.Lock()
+			err := rw.write(st.handle(req, br))
+			serving.Unlock()
+			if err != nil {
 				return err
 			}
 		}
+	}
+}
+
+// shutdownOnSignal closes the store cleanly on SIGINT or SIGTERM, then exits.
+//
+// Without this a signalled helper dies where it stands, leaving a run directory of
+// artifacts nothing stripped — on a host that cancels jobs, that is most of what
+// fills live/. It cannot be done by closing stdin to end the protocol loop, the way
+// the go command's own shutdown does: Go keeps stdin blocking rather than pollable,
+// so Close cannot interrupt a read already waiting in the kernel and the loop would
+// never return. So the cleanup runs from here instead, taking the same mutex the
+// loop holds while serving a request, and waiting on the same group as its gets.
+// The read is simply abandoned; there is no way to unblock it and nothing left to
+// read.
+//
+// SIGKILL cannot be caught, so the live-run sweep is still the backstop. And this
+// says nothing about the helper becoming a zombie: cmd/go never waits on the child
+// it spawned, so reaping is up to whatever ends up its parent.
+func shutdownOnSignal(serving *sync.Mutex, wg *sync.WaitGroup, closeStore func()) func() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-signals:
+		}
+		// Restore the default disposition, so a second signal kills outright
+		// rather than waiting on a cleanup that is evidently not finishing.
+		signal.Stop(signals)
+		serving.Lock()
+		wg.Wait()
+		closeStore()
+		os.Exit(0)
+	}()
+	return func() {
+		signal.Stop(signals)
+		close(done)
 	}
 }
 

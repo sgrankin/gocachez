@@ -444,6 +444,71 @@ func TestStatusReportsWhetherMaintenanceHasRun(t *testing.T) {
 	}
 }
 
+// erroringReader yields its payload and then a fixed error, standing in for stdin
+// going away mid-session.
+type erroringReader struct {
+	payload []byte
+	err     error
+}
+
+func (r *erroringReader) Read(p []byte) (int, error) {
+	if len(r.payload) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.payload)
+	r.payload = r.payload[n:]
+	return n, nil
+}
+
+// A signalled helper closes its own stdin so the protocol loop ends the same way
+// the go command's shutdown ends it, letting the deferred close strip live files
+// and unregister the run. Treating that as a failure instead would skip nothing —
+// the close is deferred either way — but it would report an error for an ordinary
+// shutdown, and leave the run dir behind on the error path before this.
+func TestRunTreatsClosedStdinAsEndOfInput(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	var stdout bytes.Buffer
+	err := run([]string{"-dir", cacheDir},
+		&erroringReader{err: os.ErrClosed}, &stdout)
+	if err != nil {
+		t.Fatalf("closed stdin reported as a failure: %v", err)
+	}
+
+	// The store shut down properly, so its run directory is gone rather than left
+	// for the sweep. Nothing was retained here, so the whole directory goes.
+	dirs, err := liveRunDirs(filepath.Join(cacheDir, "v1", "live"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirs) != 0 {
+		t.Errorf("live run dirs left behind after shutdown: %v", dirs)
+	}
+}
+
+// Any other read error still has to wait for in-flight gets: they materialise into
+// the run directory that the deferred close then strips.
+func TestRunClosesCleanlyOnAReadError(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	var stdout bytes.Buffer
+	err := run([]string{"-dir", cacheDir},
+		&erroringReader{payload: []byte("{not json\n"), err: io.ErrUnexpectedEOF}, &stdout)
+	if err == nil {
+		t.Fatal("a malformed request was accepted")
+	}
+
+	dirs, err := liveRunDirs(filepath.Join(cacheDir, "v1", "live"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirs) != 0 {
+		t.Errorf("live run dirs left behind after a read error: %v", dirs)
+	}
+}
+
 // recordingWriter counts Write calls, which is the only way the live file's write
 // amplification is visible: the bytes on disk are identical either way.
 type recordingWriter struct {
