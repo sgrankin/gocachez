@@ -34,7 +34,7 @@ $ go env -w GOCACHEPROG=gocachez
 ```
 
 That installs upstream. To install a fork — including this one — see
-[Installing this fork](#installing-this-fork); `go install` against a fork path
+[Installing a fork](#installing-a-fork); `go install` against a fork path
 fails, because `go.mod` still declares the upstream module path.
 
 Undo:
@@ -245,11 +245,10 @@ holds a `go list` path for longer than a job, the cache is usually archived and
 restored between runs, and several `go` commands may share one cache directory at
 once.
 
-### Installing this fork
+### Installing a fork
 
-`go install` does **not** work against a fork path. This repository's `go.mod`
-still declares the upstream module path, so asking for it by the fork's path
-fails:
+A fork's `go.mod` still declares the upstream module path, so asking for it by
+the fork's own path fails:
 
 ```console
 $ go install github.com/sgrankin/gocachez@main
@@ -258,24 +257,54 @@ go: github.com/sgrankin/gocachez@main: version constraints conflict:
 	        but was required as: github.com/sgrankin/gocachez
 ```
 
-Clone and build instead. The module path is only consulted when resolving a
-module remotely, so building from a checkout is fine:
+Track it as a tool of the project that uses it, and redirect the upstream path
+with `replace`. From the module that will run the builds:
+
+```console
+$ go get -tool github.com/jakebailey/gocachez
+$ go mod edit -replace github.com/jakebailey/gocachez=github.com/sgrankin/gocachez@main
+$ go mod tidy
+$ go install github.com/jakebailey/gocachez
+```
+
+Three details matter:
+
+- **`go install` takes no `@version` here.** With one it resolves outside the
+  module and the `replace` is ignored, which is the failure above. Without one it
+  uses this module's `go.mod`, so it builds the fork.
+- Ask for the *upstream* path everywhere. The left-hand side of the `replace` is
+  what matches the fork's declared path; that is why the redirect works at all.
+- `go mod edit` writes `main` verbatim, which is not a valid version. `go mod
+  tidy` rewrites it to a pinned pseudo-version — run it before anything else
+  reads `go.mod`.
+
+The tradeoff is that gocachez's dependencies land in your `go.sum` as indirect
+requirements. If that is unwanted, build from a checkout instead — the module path
+is only consulted when resolving remotely:
 
 ```console
 $ git clone --depth 1 https://github.com/sgrankin/gocachez /tmp/gocachez
 $ (cd /tmp/gocachez && go install .)
 ```
 
-Then point the `go` command at it. In CI prefer the environment variable over
-`go env -w`, which persists to the user's environment file:
+Either way, point the `go` command at the installed binary. In CI prefer the
+environment variable over `go env -w`, which persists to the user's environment
+file:
 
 ```console
 $ export GOCACHEPROG="$(go env GOPATH)/bin/gocachez -config /path/to/gocachez.json"
 ```
 
 `GOCACHEPROG` is a command line, not just a path, so flags can go here instead of
-a config file. Confirm you have this fork and not upstream by checking for a flag
-it adds:
+a config file. Two things to get right:
+
+- Install before exporting `GOCACHEPROG`, or the build that installs the helper
+  goes looking for a helper that does not exist yet. `GOBIN` is empty unless you
+  set it, in which case `go install` writes to `$(go env GOPATH)/bin`.
+- Do not use `go tool gocachez` as the value. `go tool` consults `GOCACHEPROG`
+  itself, so each invocation would spawn another.
+
+Confirm you have the fork and not upstream by checking for a flag it adds:
 
 ```console
 $ gocachez -h | grep max-retained-age
