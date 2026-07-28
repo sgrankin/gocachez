@@ -1,4 +1,4 @@
-module github.com/jakebailey/gocachez
+module github.com/sgrankin/gocachez
 
 go 1.25.0
 

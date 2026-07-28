@@ -16,7 +16,7 @@
     },
     "gofumpt": {
         "langVersion": "go1.26",
-        "modulePath": "github.com/jakebailey/gocachez"
+        "modulePath": "github.com/sgrankin/gocachez"
     },
     "excludes": [
         "**/.git",

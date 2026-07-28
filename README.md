@@ -8,6 +8,12 @@ old compressed entries automatically.
 This project was inspired by the discussion on
 [`golang/go#76337`](https://github.com/golang/go/issues/76337).
 
+This is a fork of [`jakebailey/gocachez`](https://github.com/jakebailey/gocachez).
+It adds a separate expiry for retained `go list` files, and changes maintenance so
+that a build never waits for it: the scan is rate-limited, skips rather than
+queues when another process holds the cache, and does its analysis without the
+lock that a starting build needs.
+
 Go `std`:
 
 | Mode             |       Cold time |       Warm time | Disk usage |
@@ -29,13 +35,9 @@ Go `std`:
 Requires Go 1.25 or newer.
 
 ```console
-$ go install github.com/jakebailey/gocachez@latest
+$ go install github.com/sgrankin/gocachez@latest
 $ go env -w GOCACHEPROG=gocachez
 ```
-
-That installs upstream. To install a fork — including this one — see
-[Installing a fork](#installing-a-fork); `go install` against a fork path
-fails, because `go.mod` still declares the upstream module path.
 
 Undo:
 
@@ -245,51 +247,27 @@ holds a `go list` path for longer than a job, the cache is usually archived and
 restored between runs, and several `go` commands may share one cache directory at
 once.
 
-### Installing a fork
+### Installing the helper
 
-A fork's `go.mod` still declares the upstream module path, so asking for it by
-the fork's own path fails:
-
-```console
-$ go install github.com/sgrankin/gocachez@main
-go: github.com/sgrankin/gocachez@main: version constraints conflict:
-	module declares its path as: github.com/jakebailey/gocachez
-	        but was required as: github.com/sgrankin/gocachez
-```
-
-Track it as a tool of the project that uses it, and redirect the upstream path
-with `replace`. From the module that will run the builds:
+Pin it as a tool of the project it builds, so the version lives in `go.mod`
+alongside everything else:
 
 ```console
-$ go get -tool github.com/jakebailey/gocachez
-$ go mod edit -replace github.com/jakebailey/gocachez=github.com/sgrankin/gocachez@main
-$ go mod tidy
-$ go install github.com/jakebailey/gocachez
+$ go get -tool github.com/sgrankin/gocachez
+$ go install github.com/sgrankin/gocachez
 ```
 
-Three details matter:
-
-- **`go install` takes no `@version` here.** With one it resolves outside the
-  module and the `replace` is ignored, which is the failure above. Without one it
-  uses this module's `go.mod`, so it builds the fork.
-- Ask for the *upstream* path everywhere. The left-hand side of the `replace` is
-  what matches the fork's declared path; that is why the redirect works at all.
-- `go mod edit` writes `main` verbatim, which is not a valid version. `go mod
-  tidy` rewrites it to a pinned pseudo-version — run it before anything else
-  reads `go.mod`.
-
-The tradeoff is that gocachez's dependencies land in your `go.sum` as indirect
-requirements. If that is unwanted, build from a checkout instead — the module path
-is only consulted when resolving remotely:
+Inside a module `go install` takes no `@version`: it uses that module's `go.mod`,
+which is what makes the pin meaningful. The tradeoff is that gocachez's
+dependencies land in your `go.sum` as indirect requirements. To keep them out,
+install a pinned version standalone instead — from anywhere:
 
 ```console
-$ git clone --depth 1 https://github.com/sgrankin/gocachez /tmp/gocachez
-$ (cd /tmp/gocachez && go install .)
+$ go install github.com/sgrankin/gocachez@v0.0.0-...
 ```
 
-Either way, point the `go` command at the installed binary. In CI prefer the
-environment variable over `go env -w`, which persists to the user's environment
-file:
+Then point the `go` command at the installed binary. In CI prefer the environment
+variable over `go env -w`, which persists to the user's environment file:
 
 ```console
 $ export GOCACHEPROG="$(go env GOPATH)/bin/gocachez -config /path/to/gocachez.json"
@@ -304,7 +282,7 @@ a config file. Two things to get right:
 - Do not use `go tool gocachez` as the value. `go tool` consults `GOCACHEPROG`
   itself, so each invocation would spawn another.
 
-Confirm you have the fork and not upstream by checking for a flag it adds:
+Confirm the binary is recent enough for the settings below:
 
 ```console
 $ gocachez -h | grep max-retained-age
