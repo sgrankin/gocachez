@@ -31,6 +31,7 @@ type runMode string
 const (
 	runModeProtocol runMode = ""
 	runModeClean    runMode = "clean"
+	runModePrune    runMode = "prune"
 	runModeStatus   runMode = "status"
 )
 
@@ -74,6 +75,9 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 
 	if mode == runModeClean {
 		return cleanCache(cfg)
+	}
+	if mode == runModePrune {
+		return pruneCache(cfg, stdout)
 	}
 	if mode == runModeStatus {
 		return writeStatus(cfg, stdout)
@@ -168,7 +172,7 @@ func stdoutIsTerminal(stdout io.Writer) bool {
 }
 
 func isRunMode(arg string) bool {
-	return arg == string(runModeClean) || arg == string(runModeStatus)
+	return arg == string(runModeClean) || arg == string(runModePrune) || arg == string(runModeStatus)
 }
 
 func startProfiling(cfg config) (func() error, error) {

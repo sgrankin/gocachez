@@ -1583,6 +1583,62 @@ func TestSweepRemovesExpiredLiveRunWhileAnotherRunIsRegistered(t *testing.T) {
 	}
 }
 
+// Nothing holds a live run dir's lock once the build that made it has exited, so
+// age is the only thing protecting it — and the escaped go-list paths inside are
+// the entire reason it outlived that build. A sweep that ignored the age would
+// yank them out from under a tool still holding one.
+func TestSweepKeepsLiveRunYoungerThanTheRetainedAge(t *testing.T) {
+	t.Parallel()
+
+	cfg := config{dir: t.TempDir(), maxAge: defaultMaxAge, maxRetainedAge: time.Hour}
+	paths := retainedCache(t, cfg, bytes.Repeat([]byte{126}, 32))
+
+	// close stamped run.lock, so the dir is as fresh as it ever gets.
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(paths.live); err != nil {
+		t.Fatalf("sweep removed an escaped path from a live run dir well inside its age: %v", err)
+	}
+}
+
+// With age-based pruning off, nothing may expire by age — live run dirs included.
+// trimCutoff of a zero age is an hour ago rather than the beginning of time, so
+// the check for a disabled age is what has to stop the sweep; the cutoff
+// arithmetic would happily expire everything older than mtimeInterval.
+func TestSweepKeepsLiveRunsWhenAgeBasedPruningIsDisabled(t *testing.T) {
+	t.Parallel()
+
+	cfg := config{dir: t.TempDir()} // maxAge and maxRetainedAge both zero
+	paths := retainedCache(t, cfg, bytes.Repeat([]byte{127}, 32))
+
+	old := time.Now().Add(-24 * time.Hour)
+	if err := os.Chtimes(filepath.Join(paths.runDir, "run.lock"), old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(paths.live); err != nil {
+		t.Fatalf("sweep expired a live run with age-based pruning disabled: %v", err)
+	}
+}
+
 // The two passes are stamped independently and neither implies the other. In
 // normal operation the scan's stamp is never fresher than the sweep's — it is
 // only written when a scan completes — so the passes tend to come due together
@@ -2876,6 +2932,103 @@ func TestRunHelpDoesNotCreateCacheState(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cacheDir, "v1")); !os.IsNotExist(err) {
 		t.Fatalf("help created cache state: %v", err)
+	}
+}
+
+// The command exists to take maintenance off a build's exit path, so its whole
+// job is to run when the interval says no. It also proves the command does not
+// register a run of its own: countRuns counts every row including the caller's,
+// so a self-registering prune would find the cache busy and delete nothing.
+func TestRunPruneDeletesInsideTheInterval(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	outputID := bytes.Repeat([]byte{47}, 32)
+	st, err := newStore(config{dir: cacheDir, maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{48}, 32),
+		OutputID: outputID,
+		BodySize: 4,
+	}, bufio.NewReader(encodedBody([]byte("body")))); err != nil {
+		t.Fatal(err)
+	}
+	stale := unixMillis(trimCutoff(defaultMaxAge, time.Now())) - int64(time.Minute/time.Millisecond)
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entries SET accessed_at = ?`, stale); err != nil {
+		t.Fatal(err)
+	}
+	blobPath := st.blobPath(hexOf(outputID))
+	// close both stamps the interval and leaves the cache idle, so nothing but an
+	// explicit request can prune here.
+	st.close()
+	if _, err := os.Stat(pruneStampPath(st.versionDir)); err != nil {
+		t.Fatalf("close did not stamp, so the interval is not what blocks: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	if err := run([]string{"prune", "-dir", cacheDir, "-max-age", "5d"}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatalf("prune command did not delete the stale blob: stat err = %v, want not exist", err)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("prune stdout = %q, want empty on an idle cache", stdout.String())
+	}
+}
+
+// Explicitly asking cannot waive the rule that makes deletion safe. Reporting
+// nothing here would look like success, which is the trap for a CI step.
+func TestRunPruneReportsBuildsStillUsingTheCache(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	cfg := config{dir: cacheDir, maxAge: defaultMaxAge, maxRetainedAge: time.Hour}
+	paths := retainedCache(t, cfg, bytes.Repeat([]byte{49}, 32))
+	old := trimCutoff(time.Hour, time.Now()).Add(-time.Minute)
+	for _, path := range []string{paths.export, filepath.Join(paths.runDir, "run.lock")} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	busy, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.close()
+
+	var stdout bytes.Buffer
+	if err := run([]string{"prune", "-dir", cacheDir, "-max-retained-age", "1h"}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "still using the cache") {
+		t.Errorf("prune stdout = %q, want a note that the cache is in use", stdout.String())
+	}
+	// The live run is guarded by its own lock, so it still goes; the retained
+	// file, equally expired, has to wait for an idle cache.
+	if _, err := os.Stat(paths.runDir); !os.IsNotExist(err) {
+		t.Errorf("expired live run survived: stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(paths.export); err != nil {
+		t.Errorf("retained file deleted while a build was registered: %v", err)
+	}
+}
+
+func TestRunPruneOnACacheThatWasNeverUsed(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	if err := run([]string{"prune", "-dir", filepath.Join(t.TempDir(), "absent")}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatalf("prune on an unused cache: %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("prune stdout = %q, want empty", stdout.String())
 	}
 }
 

@@ -423,6 +423,61 @@ func (st *store) deleteOutput(outputID string) error {
 // run.lock throughout, and entries for anything it retains are freshly
 // accessed, so the reachable outcome is a lost retained file rather than a lost
 // blob or a dangling row.
+// pruneCache runs maintenance now rather than when the interval next allows it.
+//
+// Maintenance otherwise happens as a helper exits, and the go command waits for
+// that, so its cost lands on a build. A CI job can run this between steps
+// instead, where the same work costs nobody's build latency.
+//
+// It cannot delete blobs or entries while another build is registered — that is
+// what makes deletion safe and is not something an explicit request can waive —
+// so it says as much rather than reporting nothing and looking successful.
+func pruneCache(cfg config, stdout io.Writer) error {
+	versionDir, blobsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
+	dbPath := filepath.Join(versionDir, "cache.db")
+	if !regularFile(dbPath) {
+		return nil
+	}
+
+	// Briefly under the lifecycle lock, as newStore opens it: initDB may still
+	// have schema work to do, and nothing else serialises that.
+	var db *sql.DB
+	if err := withFileLock(lifecycleLockPath, func() error {
+		var err error
+		db, err = openDB(dbPath)
+		return err
+	}); err != nil {
+		return err
+	}
+	defer db.Close() //nolint:errcheck // read-mostly; the deletions below are already committed
+
+	// Deliberately no registered run. countRuns counts every row including the
+	// caller's, so a prune that registered itself would always find the cache
+	// busy and decline.
+	st := &store{
+		config:            cfg,
+		db:                db,
+		q:                 newCatalog(db),
+		versionDir:        versionDir,
+		blobsDir:          blobsDir,
+		liveRoot:          liveRoot,
+		lifecycleLockPath: lifecycleLockPath,
+	}
+	active, err := st.q.countRuns(context.Background())
+	if err != nil {
+		return fmt.Errorf("count active runs: %w", err)
+	}
+	if active > 0 {
+		if _, err := fmt.Fprintf(stdout, "gocachez: %d build(s) still using the cache; only live-run cleanup can run\n", active); err != nil {
+			return fmt.Errorf("report active runs: %w", err)
+		}
+	}
+	if err := clearMaintenanceStamps(versionDir); err != nil {
+		return err
+	}
+	return st.prune()
+}
+
 func (st *store) prune() error {
 	// Check the stamps before anything else: skipping is the common case.
 	now := time.Now()
@@ -468,11 +523,42 @@ func (st *store) prune() error {
 // leaves its directory behind on purpose, with no runs row, and only age
 // reclaims it.
 func (st *store) sweepLiveRuns(now time.Time) error {
-	runDirs, err := st.planOldRetainedLiveDirs(now)
-	if err != nil {
-		return err
+	if st.retainedAge() <= 0 {
+		return nil
 	}
-	return st.removeExpiredLiveRuns(runDirs, trimCutoff(st.retainedAge(), now))
+	entries, err := os.ReadDir(st.liveRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read live dir: %w", err)
+	}
+	// A live run dir matters as much as the retained/ copy it links to: the path a
+	// tool actually opened is the live one, so the inode outlives an expired
+	// retained/ entry but not an expired live dir.
+	cutoff := trimCutoff(st.retainedAge(), now)
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		runDir := filepath.Join(st.liveRoot, entry.Name())
+		expired, err := liveRunExpiredIfUnlocked(runDir, cutoff)
+		if err != nil {
+			return err
+		}
+		if !expired {
+			continue
+		}
+		if err := os.RemoveAll(runDir); err != nil {
+			return fmt.Errorf("remove old retained live run: %w", err)
+		}
+		removed++
+	}
+	if st.verbose && removed > 0 {
+		log.Printf("gocachez: pruned %d old retained live runs", removed)
+	}
+	return nil
 }
 
 func (st *store) sweepDue(now time.Time) bool {
@@ -873,68 +959,6 @@ func (st *store) removeExpiredRetainedFiles(paths []string, cutoff time.Time) er
 	return nil
 }
 
-// planOldRetainedLiveDirs lists live run dirs old enough to remove. These matter
-// as much as the retained/ copies: the path a tool actually opened is the live
-// one, hard-linked to the retained file, so the inode outlives an expired
-// retained/ entry but not an expired live dir.
-func (st *store) planOldRetainedLiveDirs(now time.Time) ([]string, error) {
-	if st.retainedAge() <= 0 {
-		return nil, nil
-	}
-	entries, err := os.ReadDir(st.liveRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read live dir: %w", err)
-	}
-	cutoff := trimCutoff(st.retainedAge(), now)
-	var expired []string
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		runDir := filepath.Join(st.liveRoot, entry.Name())
-		isExpired, err := liveRunExpiredIfUnlocked(runDir, cutoff)
-		if err != nil {
-			return nil, err
-		}
-		if isExpired {
-			expired = append(expired, runDir)
-		}
-	}
-	return expired, nil
-}
-
-func (st *store) removeExpiredLiveRuns(runDirs []string, cutoff time.Time) error {
-	if len(runDirs) == 0 {
-		return nil
-	}
-	removed := 0
-	for _, runDir := range runDirs {
-		// Re-check under the lock: the run may have been reclaimed since, and a
-		// dir is only ever removed while nothing holds its lock.
-		expired, err := liveRunExpiredIfUnlocked(runDir, cutoff)
-		if err != nil {
-			return err
-		}
-		if !expired {
-			continue
-		}
-		if err := os.RemoveAll(runDir); err != nil {
-			return fmt.Errorf("remove old retained live run: %w", err)
-		}
-		removed++
-	}
-	if st.verbose && removed > 0 {
-		log.Printf("gocachez: pruned %d old retained live runs", removed)
-	}
-	return nil
-}
-
-// liveRunExpiredIfUnlocked reports whether a live run is both idle and older
-// than the cutoff. The lock is opened without O_CREATE so that merely asking
-// cannot resurrect a run dir that is midway through being removed.
 func liveRunExpiredIfUnlocked(runDir string, cutoff time.Time) (bool, error) {
 	runLock := flock.New(filepath.Join(runDir, "run.lock"), flock.SetFlag(os.O_RDONLY))
 	locked, err := runLock.TryLock()
