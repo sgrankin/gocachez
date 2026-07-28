@@ -354,6 +354,59 @@ func TestCacheRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+// recordingWriter counts Write calls, which is the only way the live file's write
+// amplification is visible: the bytes on disk are identical either way.
+type recordingWriter struct {
+	writes int
+	buf    bytes.Buffer
+}
+
+func (w *recordingWriter) Write(p []byte) (int, error) {
+	w.writes++
+	return w.buf.Write(p)
+}
+
+// A put body is a base64 decoder, and its Read yields at most 768 bytes however
+// large the destination, so writing it straight to the live file turned a 32MiB
+// artifact into 43,691 write syscalls at 767 bytes each — measured, and matching a
+// production trace of ~40,000 writes per blob. The cache's contents are the same
+// either way, so only the call count can catch a regression.
+func TestPutBatchesLiveFileWrites(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	// Deliberately not a whole number of buffers: a missing Flush would drop the
+	// tail, which the content check below catches.
+	body := bytes.Repeat([]byte("go build artifact "), (5*liveWriteBuffer/2)/18)
+	encoded := base64.StdEncoding.EncodeToString(body)
+
+	live := &recordingWriter{}
+	written, err := st.streamPutBody(live, io.Discard,
+		base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if written != int64(len(body)) {
+		t.Errorf("written = %d, want %d", written, len(body))
+	}
+	if !bytes.Equal(live.buf.Bytes(), body) {
+		t.Errorf("live file got %d bytes, want %d — a dropped Flush loses the tail",
+			live.buf.Len(), len(body))
+	}
+	// Ceiling of body/buffer, plus the flush of the partial tail.
+	maxWrites := len(body)/liveWriteBuffer + 2
+	if live.writes > maxWrites {
+		t.Errorf("live file took %d writes for %d bytes (%d B/write); want at most %d",
+			live.writes, len(body), len(body)/live.writes, maxWrites)
+	}
+}
+
 func TestPutDrainsBodyOnSetupError(t *testing.T) {
 	t.Parallel()
 

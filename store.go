@@ -69,6 +69,7 @@ type store struct {
 	mu                sync.Mutex
 	encoderPool       sync.Pool
 	decoderPool       sync.Pool
+	liveWriterPool    sync.Pool
 	materialized      map[string]string
 	accessed          map[string]int64
 	// installed counts compressed bytes this run put, so a build large enough

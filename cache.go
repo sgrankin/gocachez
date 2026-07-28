@@ -62,6 +62,12 @@ const (
 	// only grows past this when many entries were touched in the same
 	// millisecond.
 	evictionSampleSize = 2048
+
+	// liveWriteBuffer batches writes to the live file, whose source hands over at
+	// most 768 bytes at a time (see streamPutBody). Puts are serialised on the
+	// protocol read loop, and the writers are pooled, so this is one buffer for
+	// the process rather than one per put.
+	liveWriteBuffer = 1 << 20
 )
 
 // encoderLevel trades put throughput for cache size. Measured over 900MiB of
@@ -139,13 +145,13 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 		return response{}, fmt.Errorf("create zstd encoder: %w", err)
 	}
 
-	written, copyErr := io.Copy(io.MultiWriter(bodyFile, zw), body)
+	written, copyErr := st.streamPutBody(bodyFile, zw, body)
 	closeErr := zw.Close()
 	st.putEncoder(zw)
 	bodyCloseErr := bodyFile.Close()
 	blobCloseErr := blobTmp.Close()
 	if copyErr != nil {
-		return response{}, fmt.Errorf("read put body: %w", copyErr)
+		return response{}, copyErr
 	}
 	bodyDrained = true
 	if closeErr != nil {
@@ -322,6 +328,43 @@ func (st *store) materialize(ent entry) (string, error) {
 
 	keepBody = true
 	return bodyPath, nil
+}
+
+// streamPutBody writes the artifact to the live file and the compressed blob in
+// one pass over the request body.
+//
+// The live file has to be buffered. body is a base64 decoder, and its Read
+// returns at most 768 bytes however large the destination — outbuf is
+// [1024 / 4 * 3]byte, bounded by the 1024-byte input buffer — so io.Copy's 32KiB
+// buffer buys nothing, and writing straight to the *os.File turned a 32MiB
+// artifact into 43,691 write syscalls at 767 bytes each. The zstd encoder
+// buffers internally, so only this side needed it.
+func (st *store) streamPutBody(live io.Writer, blob io.Writer, body io.Reader) (int64, error) {
+	bw := st.getLiveWriter(live)
+	defer st.putLiveWriter(bw)
+
+	written, err := io.Copy(io.MultiWriter(bw, blob), body)
+	if err != nil {
+		return written, fmt.Errorf("read put body: %w", err)
+	}
+	if err := bw.Flush(); err != nil {
+		return written, fmt.Errorf("write live file: %w", err)
+	}
+	return written, nil
+}
+
+func (st *store) getLiveWriter(w io.Writer) *bufio.Writer {
+	if bw, ok := st.liveWriterPool.Get().(*bufio.Writer); ok {
+		bw.Reset(w)
+		return bw
+	}
+	return bufio.NewWriterSize(w, liveWriteBuffer)
+}
+
+func (st *store) putLiveWriter(bw *bufio.Writer) {
+	// Reset before pooling, or the buffer keeps the live file reachable.
+	bw.Reset(io.Discard)
+	st.liveWriterPool.Put(bw)
 }
 
 func (st *store) getEncoder(w io.Writer) (*zstd.Encoder, error) {
