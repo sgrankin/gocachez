@@ -553,7 +553,7 @@ func TestReclaimsAbandonedUnlockedRun(t *testing.T) {
 	if _, err := os.Stat(livePath); !os.IsNotExist(err) {
 		t.Fatalf("abandoned live file still exists: err=%v", err)
 	}
-	if got := countRows(t, st.db, `SELECT COUNT(*) FROM runs WHERE run_id = ?`, runID); got != 0 {
+	if got := countRunRows(t, st.db, runID); got != 0 {
 		t.Fatalf("abandoned run rows = %d, want 0", got)
 	}
 }
@@ -592,7 +592,7 @@ func TestKeepsLockedRun(t *testing.T) {
 	if _, err := os.Stat(st1.runDir); err != nil {
 		t.Fatalf("locked run dir was removed: %v", err)
 	}
-	if got := countRows(t, st2.db, `SELECT COUNT(*) FROM runs WHERE run_id = ?`, st1.runID); got != 1 {
+	if got := countRunRows(t, st2.db, st1.runID); got != 1 {
 		t.Fatalf("locked run rows = %d, want 1", got)
 	}
 }
@@ -616,8 +616,55 @@ func TestCleanupDropsMissingRunRecord(t *testing.T) {
 	if err := st.cleanupAbandonedRuns(); err != nil {
 		t.Fatal(err)
 	}
-	if got := countRows(t, st.db, `SELECT COUNT(*) FROM runs WHERE run_id = ?`, "run-missing"); got != 0 {
+	if got := countRunRows(t, st.db, "run-missing"); got != 0 {
 		t.Fatalf("missing run rows = %d, want 0", got)
+	}
+}
+
+// Every pass sees the same rows in the same order, so a run that cannot be
+// reclaimed used to shadow every row behind it — permanently, since both hot
+// callers only log the error. live/ then grew without bound while the reclaim
+// that should have emptied it looked like it was running.
+func TestCleanupReclaimsPastARunItCannotReclaim(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	// Registered first, so it comes first in the unordered listOtherRuns scan. Its
+	// lock file does not exist and the directory denies creating one, so taking
+	// the lock fails rather than reporting the run busy.
+	blocked := filepath.Join(st.liveRoot, "run-unreclaimable")
+	if err := os.MkdirAll(blocked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
+	if err := st.q.registerRun(context.Background(), "run-unreclaimable", blocked,
+		filepath.Join(blocked, "run.lock"), unixMillis(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+
+	reclaimable := filepath.Join(st.liveRoot, "run-reclaimable")
+	if err := os.MkdirAll(reclaimable, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.q.registerRun(context.Background(), "run-reclaimable", reclaimable,
+		filepath.Join(reclaimable, "run.lock"), unixMillis(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+
+	// The failure is still reported; it just no longer stops the walk.
+	if err := st.cleanupAbandonedRuns(); err == nil {
+		t.Error("cleanupAbandonedRuns hid the run it could not reclaim")
+	}
+	if _, err := os.Stat(reclaimable); !os.IsNotExist(err) {
+		t.Errorf("reclaimable run stranded behind a failing one: stat err = %v, want not exist", err)
+	}
+	if got := countRunRows(t, st.db, "run-reclaimable"); got != 0 {
+		t.Errorf("reclaimable run rows = %d, want 0", got)
 	}
 }
 
@@ -4981,10 +5028,11 @@ func errorsIs(err, target error) bool {
 	return err != nil && errors.Is(err, target)
 }
 
-func countRows(t *testing.T, db *sql.DB, query string, args ...any) int {
+func countRunRows(t *testing.T, db *sql.DB, runID string) int {
 	t.Helper()
 	var count int
-	if err := db.QueryRowContext(context.Background(), query, args...).Scan(&count); err != nil {
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM runs WHERE run_id = ?`, runID).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	return count

@@ -519,9 +519,12 @@ func (st *store) prune() error {
 // continuously the check never passed, so a pass that needs no such check never
 // ran and run directories accumulated indefinitely.
 //
-// Most of them are not leaks: every clean exit that retains a go-list file
-// leaves its directory behind on purpose, with no runs row, and only age
-// reclaims it.
+// Two very different things end up here. A clean exit that retains a go-list file
+// leaves its directory behind on purpose, holding only hard links to retained/,
+// so it costs almost nothing until its age is up. A killed helper leaves one that
+// nothing stripped, holding full uncompressed artifacts — those are what fills
+// live/, and cleanupAbandonedRuns is what should reclaim them promptly. This is
+// the backstop for the ones it cannot see, whose runs row was already deleted.
 func (st *store) sweepLiveRuns(now time.Time) error {
 	if st.retainedAge() <= 0 {
 		return nil
@@ -692,7 +695,7 @@ func (st *store) planPrune(now time.Time) (prunePlan, error) {
 // attempt is retried by the next process to exit past the interval.
 func (st *store) applyPrune(plan prunePlan) error {
 	applied, err := withFileLockIfFree(st.lifecycleLockPath, func() error {
-		if err := st.cleanupAbandonedRuns(); err != nil && st.verbose {
+		if err := st.cleanupAbandonedRuns(); err != nil {
 			log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
 		}
 		active, err := st.q.countRuns(context.Background())

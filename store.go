@@ -96,7 +96,7 @@ func newStore(cfg config) (*store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := st.cleanupAbandonedRuns(); err != nil && st.verbose {
+	if err := st.cleanupAbandonedRuns(); err != nil {
 		log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
 	}
 	return st, nil
@@ -518,16 +518,22 @@ func (st *store) cleanupAbandonedRuns() error {
 		return fmt.Errorf("query runs: %w", err)
 	}
 
+	// One run that cannot be reclaimed must not strand the rest. Every pass sees
+	// the same rows in the same order, so returning here left a single bad row
+	// shadowing every row behind it, in a loop whose error both hot callers drop
+	// — reclaim would stop for good, silently, while live/ grew without bound.
+	var errs error
 	for _, run := range runs {
 		reclaimed, err := st.tryReclaimRun(run.runID, run.path, run.lockPath)
 		if err != nil {
-			return err
+			errs = errors.Join(errs, err)
+			continue
 		}
 		if reclaimed && st.verbose {
 			log.Printf("gocachez: reclaimed abandoned live run %s", run.runID)
 		}
 	}
-	return nil
+	return errs
 }
 
 func (st *store) tryReclaimRun(runID, runDir, lockPath string) (bool, error) {
