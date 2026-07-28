@@ -63,6 +63,17 @@ const (
 	// millisecond.
 	evictionSampleSize = 2048
 
+	// accessFlushInterval bounds how long a cache hit stays invisible to the
+	// catalog. Hits are recorded in memory and were flushed only on close, so a
+	// build's reads did not exist as far as anything else was concerned until it
+	// exited — and a killed helper lost them outright, which on a host that kills
+	// helpers makes the entries most in use look like the coldest in the cache.
+	//
+	// The total rows written does not depend on this interval, only the number of
+	// transactions, so it is set by how stale eviction data may be rather than by
+	// write volume. Thirty seconds against an hourly maintenance scan.
+	accessFlushInterval = 30 * time.Second
+
 	// liveWriteBuffer batches writes to the live file, whose source hands over at
 	// most 768 bytes at a time (see streamPutBody). Puts are serialised on the
 	// protocol read loop, and the writers are pooled, so this is one buffer for
@@ -256,9 +267,25 @@ func (st *store) deleteMaterialized(outputID string) {
 }
 
 func (st *store) markEntryAccess(actionID string) {
+	now := time.Now()
 	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.accessed[actionID] = unixMillis(time.Now())
+	st.accessed[actionID] = unixMillis(now)
+	// Claim the flush while holding the lock, so concurrent gets do not each open
+	// a transaction for the same batch.
+	due := now.Sub(st.accessFlushed) >= accessFlushInterval
+	if due {
+		st.accessFlushed = now
+	}
+	st.mu.Unlock()
+
+	if !due {
+		return
+	}
+	// Deliberately on the caller's goroutine: gets already run on a bounded pool,
+	// so one of them waiting out the flush is the backpressure.
+	if err := st.flushAccessTimes(); err != nil && st.verbose {
+		log.Printf("gocachez: flush access times failed: %v", err)
+	}
 }
 
 func (st *store) flushAccessTimes() error {
@@ -580,23 +607,16 @@ func (st *store) sweepLiveRuns(now time.Time) error {
 	if st.retainedAge() <= 0 {
 		return nil
 	}
-	entries, err := os.ReadDir(st.liveRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	runDirs, err := liveRunDirs(st.liveRoot)
 	if err != nil {
-		return fmt.Errorf("read live dir: %w", err)
+		return err
 	}
 	// A live run dir matters as much as the retained/ copy it links to: the path a
 	// tool actually opened is the live one, so the inode outlives an expired
 	// retained/ entry but not an expired live dir.
 	cutoff := trimCutoff(st.retainedAge(), now)
 	removed := 0
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		runDir := filepath.Join(st.liveRoot, entry.Name())
+	for _, runDir := range runDirs {
 		expired, err := liveRunExpiredIfUnlocked(runDir, cutoff)
 		if err != nil {
 			return err

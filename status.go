@@ -515,25 +515,19 @@ func retainedFileKind(path string) retainedTypeKind {
 }
 
 func readLiveStatus(liveRoot string) (int64, int64, error) {
-	entries, err := os.ReadDir(liveRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, 0, nil
-	}
+	runDirs, err := liveRunDirs(liveRoot)
 	if err != nil {
-		return 0, 0, fmt.Errorf("read live dir: %w", err)
+		return 0, 0, err
 	}
 
 	var active, inactive int64
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
+	for _, runDir := range runDirs {
 		// Without O_CREATE this reports a missing lock rather than creating
 		// one. flock.New defaults to creating it, which would have status —
 		// a read-only report — resurrect run dirs that a concurrent prune is
 		// midway through removing, making its own rmdir fail and leaving the
 		// run to show up as inactive until maxAge elapses.
-		runLock := flock.New(filepath.Join(liveRoot, entry.Name(), "run.lock"), flock.SetFlag(os.O_RDONLY))
+		runLock := flock.New(filepath.Join(runDir, "run.lock"), flock.SetFlag(os.O_RDONLY))
 		locked, err := runLock.TryLock()
 		if err != nil {
 			_ = runLock.Close()
@@ -543,7 +537,7 @@ func readLiveStatus(liveRoot string) (int64, int64, error) {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return 0, 0, fmt.Errorf("try lock live run %s: %w", entry.Name(), err)
+			return 0, 0, fmt.Errorf("try lock live run %s: %w", filepath.Base(runDir), err)
 		}
 		if !locked {
 			_ = runLock.Close()

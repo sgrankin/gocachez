@@ -72,6 +72,7 @@ type store struct {
 	liveWriterPool    sync.Pool
 	materialized      map[string]string
 	accessed          map[string]int64
+	accessFlushed     time.Time
 	// installed counts compressed bytes this run put, so a build large enough
 	// to overshoot maxSize can force a maintenance scan on the way out instead
 	// of waiting for pruneInterval. It counts puts rather than growth — a put
@@ -134,6 +135,63 @@ func sweepStampPath(versionDir string) string {
 	return filepath.Join(versionDir, "sweep.stamp")
 }
 
+const runDirPrefix = "run-"
+
+// liveShardName spreads run directories over 100 shards. os.MkdirTemp names them
+// with a decimal random suffix, whose low digits are uniform, so the last two
+// characters need no hashing. Names are digits rather than the hex that blobs and
+// retained files use, which also makes the layout a run directory came from
+// obvious at a glance.
+func liveShardName(runID string) string {
+	if len(runID) < 2 {
+		return "00"
+	}
+	return runID[len(runID)-2:]
+}
+
+// liveRunDirs lists every live run directory under liveRoot.
+//
+// Run directories live one shard deep — live/<xx>/run-* — for the same reason
+// blobs and retained files do: nothing bounds how many accumulate if reclaim
+// stops, and recovering from that should not mean churning a directory with tens
+// of thousands of entries. Caches written before this keep them directly under
+// live/, and those are exactly the ones with a backlog to clear, so both layouts
+// are walked.
+func liveRunDirs(liveRoot string) ([]string, error) {
+	entries, err := os.ReadDir(liveRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read live dir: %w", err)
+	}
+
+	var dirs []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(entry.Name(), runDirPrefix) {
+			dirs = append(dirs, filepath.Join(liveRoot, entry.Name()))
+			continue
+		}
+		shard := filepath.Join(liveRoot, entry.Name())
+		shardEntries, err := os.ReadDir(shard)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read live shard: %w", err)
+		}
+		for _, sub := range shardEntries {
+			if sub.IsDir() && strings.HasPrefix(sub.Name(), runDirPrefix) {
+				dirs = append(dirs, filepath.Join(shard, sub.Name()))
+			}
+		}
+	}
+	return dirs, nil
+}
+
 // maintenanceLockPath names the lock that admits one scanner at a time. It is
 // separate from the lifecycle lock so that serialising scans against each other
 // never makes a build wait to open the store.
@@ -148,11 +206,22 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 	if err := os.MkdirAll(liveRoot, 0o777); err != nil {
 		return nil, fmt.Errorf("create live dir: %w", err)
 	}
-	runDir, err := os.MkdirTemp(liveRoot, "run-")
+	runDir, err := os.MkdirTemp(liveRoot, runDirPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("create live run dir: %w", err)
 	}
+	// Move it into a shard. os.MkdirTemp picks the unique name, and deriving the
+	// shard from that name keeps the choice in one place; failing the move leaves
+	// the run flat, which liveRunDirs still finds.
 	runID := filepath.Base(runDir)
+	shard := filepath.Join(liveRoot, liveShardName(runID))
+	if err := os.MkdirAll(shard, 0o777); err != nil {
+		_ = os.RemoveAll(runDir)
+		return nil, fmt.Errorf("create live shard dir: %w", err)
+	}
+	if sharded := filepath.Join(shard, runID); os.Rename(runDir, sharded) == nil {
+		runDir = sharded
+	}
 	runLock := flock.New(filepath.Join(runDir, "run.lock"))
 	if err := runLock.Lock(); err != nil {
 		_ = runLock.Close()
@@ -180,6 +249,7 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 		runLock:           runLock,
 		materialized:      make(map[string]string),
 		accessed:          make(map[string]int64),
+		accessFlushed:     time.Now(),
 	}
 	if err := st.q.prepare(context.Background()); err != nil {
 		_ = st.q.close()

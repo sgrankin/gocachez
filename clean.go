@@ -108,25 +108,18 @@ func (st *store) cleanLocked() error {
 }
 
 func (st *store) removeUnusedLiveDirs() (bool, error) {
-	entries, err := os.ReadDir(st.liveRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
+	runDirs, err := liveRunDirs(st.liveRoot)
 	if err != nil {
-		return false, fmt.Errorf("read live dir: %w", err)
+		return false, err
 	}
 
 	active := false
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		runDir := filepath.Join(st.liveRoot, entry.Name())
+	for _, runDir := range runDirs {
 		runLock := flock.New(filepath.Join(runDir, "run.lock"))
 		locked, err := runLock.TryLock()
 		if err != nil {
 			_ = runLock.Close()
-			return false, fmt.Errorf("try lock live run %s: %w", entry.Name(), err)
+			return false, fmt.Errorf("try lock live run %s: %w", filepath.Base(runDir), err)
 		}
 		if !locked {
 			_ = runLock.Close()

@@ -1683,6 +1683,113 @@ func TestSweepRemovesExpiredLiveRunWhileAnotherRunIsRegistered(t *testing.T) {
 	}
 }
 
+func TestNewStoreShardsTheRunDirectory(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	rel, err := filepath.Rel(st.liveRoot, st.runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(rel) == "." {
+		t.Errorf("run dir %q is directly under live/, want one shard deep", rel)
+	}
+	entries, err := os.ReadDir(st.liveRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), runDirPrefix) {
+			t.Errorf("live/ holds run dir %q directly", entry.Name())
+		}
+	}
+	dirs, err := liveRunDirs(st.liveRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(dirs, st.runDir) {
+		t.Errorf("liveRunDirs = %v, want it to contain %q", dirs, st.runDir)
+	}
+}
+
+// Caches written before sharding keep run dirs directly under live/ — and those
+// are exactly the caches with a backlog to clear, so a walker that only looked one
+// shard deep would strand every one of them permanently.
+func TestSweepReclaimsUnshardedRunDirs(t *testing.T) {
+	t.Parallel()
+
+	cfg := config{dir: t.TempDir(), maxAge: defaultMaxAge, maxRetainedAge: time.Hour}
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	legacy := filepath.Join(st.liveRoot, "run-fromtheoldlayout")
+	if err := os.MkdirAll(legacy, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "aa11-unstripped"), []byte("artifact"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	lock := filepath.Join(legacy, "run.lock")
+	if err := os.WriteFile(lock, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	old := trimCutoff(time.Hour, time.Now()).Add(-time.Minute)
+	if err := os.Chtimes(lock, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Errorf("unsharded run dir survived: stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(st.runDir); err != nil {
+		t.Errorf("this store's own sharded run dir was removed: %v", err)
+	}
+}
+
+// status reports on whatever layout it finds, so a mixed cache mid-migration is
+// counted once per run rather than once per layout.
+func TestStatusCountsRunsInBothLayouts(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	legacy := filepath.Join(st.liveRoot, "run-fromtheoldlayout")
+	if err := os.MkdirAll(legacy, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "run.lock"), nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	active, inactive, err := readLiveStatus(st.liveRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 {
+		t.Errorf("active = %d, want 1 (this store's sharded run)", active)
+	}
+	if inactive != 1 {
+		t.Errorf("inactive = %d, want 1 (the unsharded run)", inactive)
+	}
+}
+
 // Nothing holds a live run dir's lock once the build that made it has exited, so
 // age is the only thing protecting it — and the escaped go-list paths inside are
 // the entire reason it outlived that build. A sweep that ignored the age would
@@ -2804,6 +2911,88 @@ func TestAccessTimesFlushOnClose(t *testing.T) {
 	}
 	if accessedAt <= 1000 {
 		t.Fatalf("accessed_at = %d, want > 1000", accessedAt)
+	}
+}
+
+// Hits were only persisted on close, so a running build's reads did not exist as
+// far as the catalog was concerned — and a killed helper lost them entirely, which
+// on a host that kills helpers makes the entries most in use look like the coldest
+// in the cache. Eviction ranks on exactly this column.
+func TestGetPersistsAccessTimesWithoutClosing(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	actionID := bytes.Repeat([]byte{91}, 32)
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: bytes.Repeat([]byte{92}, 32),
+		BodySize: 4,
+	}, bufio.NewReader(encodedBody([]byte("body")))); err != nil {
+		t.Fatal(err)
+	}
+	actionHex := hexOf(actionID)
+	storedAccess := func() int64 {
+		t.Helper()
+		var at int64
+		if err := st.db.QueryRowContext(context.Background(),
+			`SELECT accessed_at FROM entries WHERE action_id = ?`, actionHex).Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, int64(1000), actionHex); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inside the interval the hit stays buffered: one transaction per get would
+	// put the catalog's single writer on the read path.
+	if _, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := storedAccess(); got != 1000 {
+		t.Errorf("accessed_at = %d after a hit inside the interval, want it still buffered at 1000", got)
+	}
+
+	// Stand in for accessFlushInterval elapsing.
+	st.mu.Lock()
+	st.accessFlushed = time.Now().Add(-2 * accessFlushInterval)
+	st.mu.Unlock()
+
+	if _, err := st.get(request{ID: 3, Command: cmdGet, ActionID: actionID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := storedAccess(); got <= 1000 {
+		t.Errorf("accessed_at = %d, want the hit persisted without a close", got)
+	}
+	// And the buffer is handed over, not copied.
+	st.mu.Lock()
+	buffered := len(st.accessed)
+	st.mu.Unlock()
+	if buffered != 0 {
+		t.Errorf("%d access times still buffered after a flush, want 0", buffered)
+	}
+
+	// The flush must restart the interval. Without that, the first one to come due
+	// leaves every later get flushing too, which is the per-get transaction the
+	// buffer exists to avoid.
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, int64(2000), actionHex); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.get(request{ID: 4, Command: cmdGet, ActionID: actionID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := storedAccess(); got != 2000 {
+		t.Errorf("accessed_at = %d after the flush, want 2000 — the interval did not restart", got)
 	}
 }
 
