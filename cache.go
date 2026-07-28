@@ -463,6 +463,14 @@ func pruneCache(cfg config, stdout io.Writer) error {
 		liveRoot:          liveRoot,
 		lifecycleLockPath: lifecycleLockPath,
 	}
+	// Reclaim before counting, for both halves of the answer. This is the only
+	// path that frees a killed helper's directory without waiting for it to age
+	// out, and it is what empties a live/ tree full of unstripped artifacts; it
+	// needs no lifecycle lock, since each directory is taken on its own. Counting
+	// after means the figure below is live builds rather than dead rows.
+	if err := st.cleanupAbandonedRuns(); err != nil {
+		log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
+	}
 	active, err := st.q.countRuns(context.Background())
 	if err != nil {
 		return fmt.Errorf("count active runs: %w", err)

@@ -3029,6 +3029,60 @@ func TestRunPruneDeletesInsideTheInterval(t *testing.T) {
 	}
 }
 
+// A directory left by a killed helper holds full uncompressed artifacts, because
+// nothing stripped them, and no tool holds a path into a build that died. Waiting
+// for it to age out is what let live/ grow to several times the size of the cache
+// it belongs to, so prune must reclaim it on its runs row, not on its age — and
+// while other builds are running, which on a busy machine is always.
+func TestRunPruneReclaimsAKilledRunYoungerThanTheCutoff(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	cfg := config{dir: cacheDir, maxAge: defaultMaxAge, maxRetainedAge: time.Hour}
+	busy, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.close()
+
+	// Stand in for a helper killed mid-build: its row survives, its directory
+	// still holds what it had materialised, and its lock is free.
+	killed := filepath.Join(busy.liveRoot, "run-killed")
+	if err := os.MkdirAll(killed, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(killed, "aa11-unstripped")
+	if err := os.WriteFile(artifact, bytes.Repeat([]byte("artifact"), 512), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(killed, "run.lock"), nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := busy.q.registerRun(context.Background(), "run-killed", killed,
+		filepath.Join(killed, "run.lock"), unixMillis(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	if err := run([]string{"prune", "-dir", cacheDir, "-max-retained-age", "1h"}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(killed); !os.IsNotExist(err) {
+		t.Errorf("prune left a killed run to age out: stat err = %v, want not exist", err)
+	}
+	if got := countRunRows(t, busy.db, "run-killed"); got != 0 {
+		t.Errorf("killed run rows = %d, want 0", got)
+	}
+	// The live build must be untouched, and still counted.
+	if _, err := os.Stat(busy.runDir); err != nil {
+		t.Errorf("prune removed a running build's live dir: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "1 build(s)") {
+		t.Errorf("prune stdout = %q, want the live build counted and the dead row not", stdout.String())
+	}
+}
+
 // Explicitly asking cannot waive the rule that makes deletion safe. Reporting
 // nothing here would look like success, which is the trap for a CI step.
 func TestRunPruneReportsBuildsStillUsingTheCache(t *testing.T) {
