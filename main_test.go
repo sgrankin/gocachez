@@ -410,6 +410,49 @@ func TestStatusDoesNotReadBlobsWithoutTypes(t *testing.T) {
 	}
 }
 
+// The tuning is in a DSN string, where a typo is silent: the driver ignores a
+// pragma it cannot parse and every lookup quietly goes back to pread. So ask the
+// database what it ended up with.
+func TestCatalogIsOpenedWithTheTuningApplied(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "cache.db")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	pragma := func(d *sql.DB, name string) int64 {
+		t.Helper()
+		var v int64
+		if err := d.QueryRowContext(context.Background(), "PRAGMA "+name).Scan(&v); err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return v
+	}
+	if got := pragma(db, "mmap_size"); got <= 0 {
+		t.Errorf("mmap_size = %d, want the mapping enabled", got)
+	}
+	if got := pragma(db, "journal_size_limit"); got <= 0 {
+		t.Errorf("journal_size_limit = %d, want the log bounded", got)
+	}
+	// Raising cache_size measured slower than the default, so it must stay put.
+	if got := pragma(db, "cache_size"); got != -2000 {
+		t.Errorf("cache_size = %d, want the default -2000", got)
+	}
+
+	// status opens read-only and scans, so it wants the mapping too.
+	ro, err := openExistingDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close() //nolint:errcheck
+	if got := pragma(ro, "mmap_size"); got <= 0 {
+		t.Errorf("read-only mmap_size = %d, want the mapping enabled", got)
+	}
+}
+
 // Without -types the type sections must be absent, not empty. A table reading
 // "None 0 0B" says the cache holds nothing of any type, which is a different claim
 // from not having looked — and on a cache of a quarter million blobs it is a

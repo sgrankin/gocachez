@@ -313,8 +313,34 @@ func runUnlocking(lock *flock.Flock, fn func() error) error {
 	return err
 }
 
+// readTuning maps the database rather than reading it through pread.
+//
+// Every cache hit is one seek into a b-tree whose index is 64-character hex, and on
+// a catalog of a few GiB each seek is several page reads that miss SQLite's own
+// cache. Mapping them costs no syscall and no copy into a buffer, which a profile of
+// a busy host showed as the top cost by a distance: _copy_to_iter, xas_load and
+// filemap_get_read_batch above every SQLite symbol, with the per-syscall overhead of
+// seccomp and apparmor stacked on each one.
+//
+// Measured on a catalog of 1.5M entries with scattered lookups: 7.4-7.7us each
+// without, 5.4-5.6us with, and more than that where syscalls are taxed. Raising
+// cache_size instead was tried and is *worse* — 8.2-9.9us — because a large private
+// cache costs more to manage than the shared page cache it duplicates. SQLite clamps
+// the request to its compile-time maximum, and to the size of the file, so this is
+// an upper bound rather than an allocation.
+//
+// Unlinking a mapped file is safe; it is truncation that raises SIGBUS, and nothing
+// here truncates the catalog — clean removes it.
+const readTuning = "&_pragma=mmap_size(2147483648)"
+
+// walTuning bounds the write-ahead log on disk. SQLite resets the log and writes
+// from the start again, but never shortens the file, so its high-water mark is
+// permanent: one host was carrying 611MiB of dead log against 16MiB in use, which
+// the 32KiB wal-index gives away.
+const walTuning = "&_pragma=journal_size_limit(67108864)"
+
 func openDB(path string) (*sql.DB, error) {
-	dsn := "file:" + url.PathEscape(filepath.ToSlash(path)) + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)"
+	dsn := "file:" + url.PathEscape(filepath.ToSlash(path)) + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)" + readTuning + walTuning
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open catalog: %w", err)
@@ -330,7 +356,7 @@ func openDB(path string) (*sql.DB, error) {
 }
 
 func openExistingDB(path string) (*sql.DB, error) {
-	dsn := "file:" + url.PathEscape(filepath.ToSlash(path)) + "?mode=ro&_pragma=busy_timeout(5000)"
+	dsn := "file:" + url.PathEscape(filepath.ToSlash(path)) + "?mode=ro&_pragma=busy_timeout(5000)" + readTuning
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open catalog: %w", err)
