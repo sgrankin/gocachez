@@ -785,7 +785,7 @@ func TestPruneRemovesOrphanRetainedFiles(t *testing.T) {
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
-	expirePruneStamp(t, st.versionDir)
+	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -840,7 +840,7 @@ func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
-	expirePruneStamp(t, st.versionDir)
+	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -883,7 +883,7 @@ func TestRefreshingRetainedFileDoesNotKeepOldLiveRun(t *testing.T) {
 	if err := os.Chtimes(filepath.Join(filepath.Dir(first.DiskPath), "run.lock"), old, old); err != nil {
 		t.Fatal(err)
 	}
-	expirePruneStamp(t, filepath.Join(cacheDir, "v1"))
+	expireMaintenanceStamps(t, filepath.Join(cacheDir, "v1"))
 
 	st, err = newStore(config{
 		dir:    cacheDir,
@@ -1232,7 +1232,7 @@ func TestPruneSkipsScanWithinInterval(t *testing.T) {
 		t.Fatalf("prune scanned within pruneInterval: %v", err)
 	}
 
-	expirePruneStamp(t, st.versionDir)
+	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -1528,7 +1528,7 @@ func TestRetainedFilesExpireOnTheirOwnAge(t *testing.T) {
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
-	expirePruneStamp(t, st.versionDir)
+	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -1543,6 +1543,185 @@ func TestRetainedFilesExpireOnTheirOwnAge(t *testing.T) {
 	// file costs a re-strip, losing this would cost a rebuild.
 	if _, err := os.Stat(st.blobPath(hexOf(outputID))); err != nil {
 		t.Fatalf("blob was pruned along with its retained file: %v", err)
+	}
+}
+
+// A live run dir is guarded by its own run.lock, so it can be reclaimed while
+// other builds are running. A retained file has no such guard and waits for an
+// idle cache. Both are equally expired here, so the idleness gate is the only
+// thing telling them apart — and bundling the sweep behind that gate is what let
+// run dirs pile up on a machine where builds overlap continuously.
+func TestSweepRemovesExpiredLiveRunWhileAnotherRunIsRegistered(t *testing.T) {
+	t.Parallel()
+
+	cfg := config{dir: t.TempDir(), maxAge: defaultMaxAge, maxRetainedAge: time.Hour}
+	paths := retainedCache(t, cfg, bytes.Repeat([]byte{122}, 32))
+
+	old := trimCutoff(time.Hour, time.Now()).Add(-time.Minute)
+	for _, path := range []string{paths.export, filepath.Join(paths.runDir, "run.lock")} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// This store's own run stays registered, so the cache is never idle.
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(paths.runDir); !os.IsNotExist(err) {
+		t.Fatalf("expired live run survived a busy cache: stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(paths.export); err != nil {
+		t.Fatalf("retained file was deleted while a run was registered: %v", err)
+	}
+}
+
+// The two passes are stamped independently and neither implies the other. In
+// normal operation the scan's stamp is never fresher than the sweep's — it is
+// only written when a scan completes — so the passes tend to come due together
+// and a suite that only ever exercises them in lockstep would not notice the
+// sweep being made to depend on the scan.
+func TestSweepRunsWhenOnlyItsOwnStampIsStale(t *testing.T) {
+	t.Parallel()
+
+	cfg := config{dir: t.TempDir(), maxAge: defaultMaxAge, maxRetainedAge: time.Hour}
+	paths := retainedCache(t, cfg, bytes.Repeat([]byte{124}, 32))
+
+	old := trimCutoff(time.Hour, time.Now()).Add(-time.Minute)
+	for _, path := range []string{paths.export, filepath.Join(paths.runDir, "run.lock")} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	// Idle, so a scan would really delete: the retained file below is the witness
+	// for whether one ran, which a stamp cannot be — a scan that declines for a
+	// busy cache leaves the stamp untouched too.
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	backdate := time.Now().Add(-2 * pruneInterval)
+	if err := os.Chtimes(sweepStampPath(st.versionDir), backdate, backdate); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(paths.runDir); !os.IsNotExist(err) {
+		t.Fatalf("sweep did not run on its own stamp: stat err = %v, want not exist", err)
+	}
+	// The retained file is equally expired and the cache is idle, so the scan's
+	// own interval is the only thing keeping it. Two checks enforce that — the
+	// early return in prune and the re-check inside applyPrune — and this pins the
+	// outcome rather than either one; see the test below for the early return.
+	if _, err := os.Stat(paths.export); err != nil {
+		t.Fatalf("scan deleted while its own interval had not elapsed: %v", err)
+	}
+}
+
+// Whether the scan was skipped or merely declined is invisible in the cache, but
+// it is the whole cost: planning walks the retained tree and reconciles 256 blob
+// shards. A sweep coming due must not drag that along, and must not reach for the
+// lifecycle lock — on an idle cache it would take it, briefly blocking any build
+// trying to open the store.
+func TestSweepAloneDoesNotAttemptTheLifecycleLock(t *testing.T) {
+	cfg := config{dir: t.TempDir(), maxAge: defaultMaxAge, maxRetainedAge: time.Hour, verbose: true}
+	paths := retainedCache(t, cfg, bytes.Repeat([]byte{125}, 32))
+
+	old := trimCutoff(time.Hour, time.Now()).Add(-time.Minute)
+	if err := os.Chtimes(filepath.Join(paths.runDir, "run.lock"), old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	// Idle: a registered run would make the scan bail before it ever reached the
+	// lock, hiding the very attempt this test is looking for.
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	backdate := time.Now().Add(-2 * pruneInterval)
+	if err := os.Chtimes(sweepStampPath(st.versionDir), backdate, backdate); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stand in for another process holding the lock, so any attempt on it reports
+	// contention instead of passing silently.
+	lock := flock.New(st.lifecycleLockPath)
+	if err := lock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close() //nolint:errcheck
+
+	var logged bytes.Buffer
+	flags := log.Flags()
+	log.SetOutput(&logged)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(flags)
+	})
+
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(paths.runDir); !os.IsNotExist(err) {
+		t.Fatalf("sweep did not run: stat err = %v, want not exist", err)
+	}
+	if strings.Contains(logged.String(), "another process holds the cache lock") {
+		t.Errorf("sweep alone reached for the lifecycle lock: %q", logged.String())
+	}
+}
+
+// The sweep walks every live run dir and locks each one, so it must not run on
+// every exit: with maxRetainedAge following maxAge, a long editor session
+// accumulates days of dirs and would pay for the walk on every build.
+func TestSweepSkipsExpiredLiveRunWithinInterval(t *testing.T) {
+	t.Parallel()
+
+	cfg := config{dir: t.TempDir(), maxAge: defaultMaxAge, maxRetainedAge: time.Hour}
+	paths := retainedCache(t, cfg, bytes.Repeat([]byte{123}, 32))
+
+	old := trimCutoff(time.Hour, time.Now()).Add(-time.Minute)
+	if err := os.Chtimes(filepath.Join(paths.runDir, "run.lock"), old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	// Only the scan is overdue. retainedCache's close stamped the sweep, so the
+	// interval has not elapsed for it.
+	backdate := time.Now().Add(-2 * pruneInterval)
+	if err := os.Chtimes(pruneStampPath(st.versionDir), backdate, backdate); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(paths.runDir); err != nil {
+		t.Fatalf("sweep ran within its interval: %v", err)
 	}
 }
 
@@ -1570,7 +1749,7 @@ func TestRetainedFilesFollowMaxAgeByDefault(t *testing.T) {
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
-	expirePruneStamp(t, st.versionDir)
+	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -1604,7 +1783,7 @@ func TestRetainedFileIsRecreatedAfterExpiring(t *testing.T) {
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
-	expirePruneStamp(t, st.versionDir)
+	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -1691,7 +1870,7 @@ func TestPruneRemovesRetainedFilesOfEvictedOutputs(t *testing.T) {
 	// Room for one output, so the older of the two is evicted by size — not by
 	// age, which would have taken its retained file along a different path.
 	st.maxSize = total * 2 / 3
-	expirePruneStamp(t, st.versionDir)
+	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -1835,7 +2014,7 @@ func TestPruneKeepsRetainedFileRefreshedAfterPlanning(t *testing.T) {
 	}
 	// The first close already stamped; without this applyPrune declines and the
 	// file survives for the wrong reason.
-	expirePruneStamp(t, st.versionDir)
+	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.applyPrune(plan); err != nil {
 		t.Fatal(err)
 	}
@@ -1877,7 +2056,7 @@ func TestPruneRechecksStampAfterTakingTheLock(t *testing.T) {
 		t.Fatalf("scan repeated work another process had already stamped: %v", err)
 	}
 
-	expirePruneStamp(t, st.versionDir)
+	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.applyPrune(plan); err != nil {
 		t.Fatal(err)
 	}
@@ -1929,7 +2108,7 @@ func TestPruneWithFreshStampDoesNotTouchTheLifecycleLock(t *testing.T) {
 
 	// With the stamp stale it does attempt the lock, and reports the loss.
 	logged.Reset()
-	expirePruneStamp(t, st.versionDir)
+	expireMaintenanceStamps(t, st.versionDir)
 	prunePromptly(t, st)
 	if !strings.Contains(logged.String(), "another process holds the cache lock") {
 		t.Fatalf("contended prune logged %q, want a skip notice", logged.String())
@@ -4591,13 +4770,17 @@ func prunePromptly(t *testing.T, st *store) {
 	}
 }
 
-// expirePruneStamp backdates the maintenance stamp, standing in for the
-// passage of pruneInterval so the next prune scans instead of skipping.
-func expirePruneStamp(t *testing.T, versionDir string) {
+// expireMaintenanceStamps backdates every maintenance stamp, standing in for the
+// passage of pruneInterval so the next prune sweeps and scans instead of
+// skipping. The sweep and the scan are stamped separately, and a test that wants
+// maintenance to happen almost always wants both.
+func expireMaintenanceStamps(t *testing.T, versionDir string) {
 	t.Helper()
 	old := time.Now().Add(-2 * pruneInterval)
-	if err := os.Chtimes(pruneStampPath(versionDir), old, old); err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
+	for _, path := range []string{pruneStampPath(versionDir), sweepStampPath(versionDir)} {
+		if err := os.Chtimes(path, old, old); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
 	}
 }
 

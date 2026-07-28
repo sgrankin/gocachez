@@ -99,12 +99,12 @@ func (st *store) cleanLocked() error {
 	if err := os.RemoveAll(retainedRoot(st.versionDir)); err != nil {
 		return fmt.Errorf("remove retained dir: %w", err)
 	}
-	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm", pruneStampPath(st.versionDir)} {
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove catalog file: %w", err)
 		}
 	}
-	return nil
+	return clearMaintenanceStamps(st.versionDir)
 }
 
 func (st *store) removeUnusedLiveDirs() (bool, error) {

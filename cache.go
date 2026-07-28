@@ -424,19 +424,84 @@ func (st *store) deleteOutput(outputID string) error {
 // accessed, so the reachable outcome is a lost retained file rather than a lost
 // blob or a dangling row.
 func (st *store) prune() error {
-	// Check the stamp before anything else: skipping is the common case.
-	if !st.pruneDue(time.Now()) {
+	// Check the stamps before anything else: skipping is the common case.
+	now := time.Now()
+	sweepDue, pruneDue := st.sweepDue(now), st.pruneDue(now)
+	if !sweepDue && !pruneDue {
 		return nil
 	}
-	// Serialise scans on a lock of their own. Analysis is expensive and its
+	// Serialise maintenance on a lock of its own. Analysis is expensive and its
 	// result is discarded if someone else stamps first, so a second scanner
 	// should skip rather than duplicate the work. This is deliberately not the
 	// lifecycle lock: a build opening a store must never wait on maintenance.
-	scanned, err := withFileLockIfFree(maintenanceLockPath(st.versionDir), st.scan)
-	if err == nil && !scanned && st.verbose {
+	ran, err := withFileLockIfFree(maintenanceLockPath(st.versionDir), func() error {
+		if sweepDue {
+			if err := st.sweepLiveRuns(now); err != nil {
+				return err
+			}
+			if err := st.markSwept(); err != nil {
+				return err
+			}
+		}
+		if !pruneDue {
+			return nil
+		}
+		return st.scan()
+	})
+	if err == nil && !ran && st.verbose {
 		log.Print("gocachez: skipped maintenance, another process is already scanning")
 	}
 	return err
+}
+
+// sweepLiveRuns removes live run directories nothing is using any more.
+//
+// This is deliberately not part of the scan below. A run directory is guarded by
+// its own run.lock, which liveRunExpiredIfUnlocked takes before removing
+// anything — a more precise guard than "no run is registered anywhere", which is
+// what blobs and entries need because they have no per-object lock. Sweeping
+// under the scan's idleness check meant that on a machine where builds overlap
+// continuously the check never passed, so a pass that needs no such check never
+// ran and run directories accumulated indefinitely.
+//
+// Most of them are not leaks: every clean exit that retains a go-list file
+// leaves its directory behind on purpose, with no runs row, and only age
+// reclaims it.
+func (st *store) sweepLiveRuns(now time.Time) error {
+	runDirs, err := st.planOldRetainedLiveDirs(now)
+	if err != nil {
+		return err
+	}
+	return st.removeExpiredLiveRuns(runDirs, trimCutoff(st.retainedAge(), now))
+}
+
+func (st *store) sweepDue(now time.Time) bool {
+	info, err := os.Stat(sweepStampPath(st.versionDir))
+	if err != nil {
+		return true
+	}
+	age := now.Sub(info.ModTime())
+	return age >= pruneInterval || age < 0
+}
+
+func (st *store) markSwept() error {
+	if err := os.WriteFile(sweepStampPath(st.versionDir), nil, 0o666); err != nil {
+		return fmt.Errorf("write sweep stamp: %w", err)
+	}
+	return nil
+}
+
+// clearMaintenanceStamps makes every pass due again. Removing the stamps is how
+// the prune command forces maintenance: the interval is checked both before the
+// maintenance lock is taken and again inside applyPrune, and an absent stamp
+// reads as due in both places.
+func clearMaintenanceStamps(versionDir string) error {
+	for _, path := range []string{pruneStampPath(versionDir), sweepStampPath(versionDir)} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("clear maintenance stamp: %w", err)
+		}
+	}
+	return nil
 }
 
 func (st *store) scan() error {
@@ -504,7 +569,6 @@ type prunePlan struct {
 	retainedCutoff time.Time
 	entryCutoff    int64            // delete entries unused since this; 0 for none
 	retained       []string         // expired retained files
-	liveRuns       []string         // expired retained live run dirs
 	blobs          []pruneCandidate // over-budget blobs, least recently used first
 	orphans        map[int][]string // shard index -> files with no catalog entry
 }
@@ -512,7 +576,6 @@ type prunePlan struct {
 func (p prunePlan) empty() bool {
 	return p.entryCutoff == 0 &&
 		len(p.retained) == 0 &&
-		len(p.liveRuns) == 0 &&
 		len(p.blobs) == 0 &&
 		len(p.orphans) == 0
 }
@@ -524,9 +587,6 @@ func (st *store) planPrune(now time.Time) (prunePlan, error) {
 		return prunePlan{}, err
 	}
 	if plan.retained, err = st.planOldRetainedFiles(now); err != nil {
-		return prunePlan{}, err
-	}
-	if plan.liveRuns, err = st.planOldRetainedLiveDirs(now); err != nil {
 		return prunePlan{}, err
 	}
 	if plan.blobs, err = st.planToMaxSize(plan.entryCutoff); err != nil {
@@ -579,9 +639,6 @@ func (st *store) deletePlanned(plan prunePlan) error {
 		return err
 	}
 	if err := st.removeExpiredRetainedFiles(plan.retained, plan.retainedCutoff); err != nil {
-		return err
-	}
-	if err := st.removeExpiredLiveRuns(plan.liveRuns, plan.retainedCutoff); err != nil {
 		return err
 	}
 	evicted, err := st.evictToMaxSize(plan.blobs)
