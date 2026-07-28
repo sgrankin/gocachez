@@ -33,6 +33,10 @@ $ go install github.com/jakebailey/gocachez@latest
 $ go env -w GOCACHEPROG=gocachez
 ```
 
+That installs upstream. To install a fork — including this one — see
+[Installing this fork](#installing-this-fork); `go install` against a fork path
+fails, because `go.mod` still declares the upstream module path.
+
 Undo:
 
 ```console
@@ -233,3 +237,104 @@ until the next scan brings the cache back under it.
 - Flag: `-config`
 - Default: `os.UserConfigDir()/gocachez/config.json`
 - Missing file is an error when explicitly set.
+
+## Continuous integration
+
+CI differs from local use in three ways that change the right settings: nothing
+holds a `go list` path for longer than a job, the cache is usually archived and
+restored between runs, and several `go` commands may share one cache directory at
+once.
+
+### Installing this fork
+
+`go install` does **not** work against a fork path. This repository's `go.mod`
+still declares the upstream module path, so asking for it by the fork's path
+fails:
+
+```console
+$ go install github.com/sgrankin/gocachez@main
+go: github.com/sgrankin/gocachez@main: version constraints conflict:
+	module declares its path as: github.com/jakebailey/gocachez
+	        but was required as: github.com/sgrankin/gocachez
+```
+
+Clone and build instead. The module path is only consulted when resolving a
+module remotely, so building from a checkout is fine:
+
+```console
+$ git clone --depth 1 https://github.com/sgrankin/gocachez /tmp/gocachez
+$ (cd /tmp/gocachez && go install .)
+```
+
+Then point the `go` command at it. In CI prefer the environment variable over
+`go env -w`, which persists to the user's environment file:
+
+```console
+$ export GOCACHEPROG="$(go env GOPATH)/bin/gocachez -config /path/to/gocachez.json"
+```
+
+`GOCACHEPROG` is a command line, not just a path, so flags can go here instead of
+a config file. Confirm you have this fork and not upstream by checking for a flag
+it adds:
+
+```console
+$ gocachez -h | grep max-retained-age
+```
+
+### Recommended configuration
+
+```json
+{
+  "maxSize": "250GiB",
+  "maxAge": "5d",
+  "maxRetainedAge": "1h"
+}
+```
+
+- `maxSize` budgets the compressed blobs only. Size the volume for this plus the
+  retained tree, or exclude the retained tree from what you archive (below).
+- `maxAge` is what actually reclaims space on a cache with high key churn, where
+  most entries are never read twice. Lower it if runs are frequent enough that
+  five days of history is not buying hits.
+- `maxRetainedAge` should cover the longest a job might hold a path printed by
+  `go list`, which is bounded by the job itself. An hour is generous for most.
+  **Do not carry this setting into local development**: `gopls` and other
+  `go/packages` consumers hold `Export` paths for as long as they run, which is
+  why the default leaves them alone.
+
+Add `"verbose": true` while validating a rollout. Maintenance logs go to stderr
+and do not interfere with the protocol, which runs over stdin and stdout.
+
+### Archiving the cache between runs
+
+Archive `v1/blobs/` and `v1/cache.db*`. Exclude these:
+
+- `v1/retained/` — regenerated on use. Costs one re-strip per package the first
+  time each is touched, and saves archiving an uncompressed copy of every
+  package's export data.
+- `v1/live/` — scratch space for one `GOCACHEPROG` process, keyed by a run
+  directory no later run can use. After a clean exit it holds only the hard links
+  that keep escaped `go list` paths alive, sharing inodes with `v1/retained/`, so
+  an archiver that does not preserve hard links stores that data twice. After a
+  killed process it can also hold full uncompressed artifacts.
+
+Both are recreated as needed, so restoring without them is safe — verified by
+archiving only `v1/blobs/` and `v1/cache.db`, restoring, and getting hits on
+every entry with the retained files rebuilt on use.
+
+### Do not run `clean` as a tidy-up step
+
+`gocachez clean` is not compaction. When no `gocachez` process is using the
+cache — the normal state between CI steps — it removes the blobs, the retained
+tree, and the catalog. That is the whole cache. Use it to reset a cache, never
+before archiving one.
+
+Nothing else is needed between runs: maintenance happens automatically as
+processes exit.
+
+### Concurrency
+
+Several `go` commands can share one cache directory. Each `gocachez` process
+registers a run, and maintenance only deletes while none are registered, so
+parallel jobs neither corrupt the cache nor block each other — the expensive part
+of a maintenance scan runs without the lock that a starting process needs.
