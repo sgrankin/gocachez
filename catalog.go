@@ -13,6 +13,7 @@ type catalogDB interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 }
 
 // idKey converts one of the hex IDs that Go passes around into the raw digest the
@@ -35,34 +36,47 @@ func idKey(hexID string) []byte {
 // action_id is deliberately absent from the select list: the caller passed it in,
 // so reading it back is a column of copying per cache hit to learn nothing.
 const lookupEntrySQL = `
-SELECT output_id, size, compressed_size, created_at, accessed_at
+SELECT output_id, size, created_at
 FROM entries
 WHERE action_id = ?`
 
 const upsertEntrySQL = `
-INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO entries(action_id, output_id, size, created_at, accessed_at)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(action_id) DO UPDATE SET
 	output_id = excluded.output_id,
 	size = excluded.size,
-	compressed_size = excluded.compressed_size,
 	created_at = excluded.created_at,
-	accessed_at = excluded.accessed_at,
-	blob_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type END,
-	blob_type_version = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type_version END,
-	retained_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.retained_type END,
-	retained_type_version = CASE WHEN entries.output_id = excluded.output_id THEN entries.retained_type_version END`
+	accessed_at = excluded.accessed_at`
+
+// Re-putting an output re-derives its compressed form, so the sizes are refreshed
+// rather than left at whatever the first put recorded. The classifications are
+// not: they describe the content, which is what the ID stands for.
+const upsertOutputSQL = `
+INSERT INTO outputs(output_id, size, compressed_size, accessed_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(output_id) DO UPDATE SET
+	size = excluded.size,
+	compressed_size = excluded.compressed_size,
+	accessed_at = excluded.accessed_at`
 
 const touchEntrySQL = `
 UPDATE entries
 SET accessed_at = ?
 WHERE action_id = ?`
 
+const touchOutputSQL = `
+UPDATE outputs
+SET accessed_at = ?
+WHERE output_id = ?`
+
 type catalog struct {
-	db         catalogDB
-	lookupStmt *sql.Stmt
-	upsertStmt *sql.Stmt
-	touchStmt  *sql.Stmt
+	db               catalogDB
+	lookupStmt       *sql.Stmt
+	upsertStmt       *sql.Stmt
+	upsertOutputStmt *sql.Stmt
+	touchStmt        *sql.Stmt
+	touchOutputStmt  *sql.Stmt
 }
 
 type catalogRun struct {
@@ -97,15 +111,23 @@ func (c *catalog) prepare(ctx context.Context) error {
 	if c.upsertStmt, err = db.PrepareContext(ctx, upsertEntrySQL); err != nil {
 		return fmt.Errorf("prepare upsert statement: %w", err)
 	}
+	if c.upsertOutputStmt, err = db.PrepareContext(ctx, upsertOutputSQL); err != nil {
+		return fmt.Errorf("prepare output upsert statement: %w", err)
+	}
 	if c.touchStmt, err = db.PrepareContext(ctx, touchEntrySQL); err != nil {
 		return fmt.Errorf("prepare touch statement: %w", err)
+	}
+	if c.touchOutputStmt, err = db.PrepareContext(ctx, touchOutputSQL); err != nil {
+		return fmt.Errorf("prepare output touch statement: %w", err)
 	}
 	return nil
 }
 
 func (c *catalog) close() error {
 	var err error
-	for _, stmt := range []*sql.Stmt{c.lookupStmt, c.upsertStmt, c.touchStmt} {
+	for _, stmt := range []*sql.Stmt{
+		c.lookupStmt, c.upsertStmt, c.upsertOutputStmt, c.touchStmt, c.touchOutputStmt,
+	} {
 		if stmt != nil {
 			err = errors.Join(err, stmt.Close())
 		}
@@ -159,21 +181,44 @@ WHERE run_id = ?`, runID)
 	return err
 }
 
+// upsertEntry records a put: the action's mapping, and the output it produced.
+// Both or neither, so an action can never name an output the inventory does not
+// know about — the direction that would make the cache claim bytes it is not
+// accounting for.
 func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
-	args := []any{
-		idKey(ent.ActionID),
-		idKey(ent.OutputID),
-		ent.Size,
-		ent.CompressedSize,
-		unixMillis(ent.CreatedAt),
-		unixMillis(ent.AccessedAt),
+	action, output := idKey(ent.ActionID), idKey(ent.OutputID)
+	accessedAt := unixMillis(ent.AccessedAt)
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin put transaction: %w", err)
 	}
-	var err error
-	if c.upsertStmt != nil {
-		_, err = c.upsertStmt.ExecContext(ctx, args...)
-	} else {
-		_, err = c.db.ExecContext(ctx, upsertEntrySQL, args...)
+	if err := txExec(ctx, tx, c.upsertOutputStmt, upsertOutputSQL,
+		output, ent.Size, ent.CompressedSize, accessedAt); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("record output: %w", err)
 	}
+	if err := txExec(ctx, tx, c.upsertStmt, upsertEntrySQL,
+		action, output, ent.Size, unixMillis(ent.CreatedAt), accessedAt); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("record entry: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit put transaction: %w", err)
+	}
+	return nil
+}
+
+// txExec runs one statement in tx, using the catalog's prepared version when it
+// has one. A catalog built for a one-shot read (see newCatalog callers that never
+// call prepare) has none, and parses the SQL instead.
+func txExec(ctx context.Context, tx *sql.Tx, stmt *sql.Stmt, query string, args ...any) error {
+	if stmt == nil {
+		_, err := tx.ExecContext(ctx, query, args...)
+		return err
+	}
+	bound := tx.StmtContext(ctx, stmt)
+	defer bound.Close() //nolint:errcheck
+	_, err := bound.ExecContext(ctx, args...)
 	return err
 }
 
@@ -187,94 +232,128 @@ func (c *catalog) lookupEntry(ctx context.Context, actionID string) (entry, erro
 	}
 	ent := entry{ActionID: actionID}
 	var outputID []byte
-	var createdAt, accessedAt int64
-	err := row.Scan(
-		&outputID,
-		&ent.Size,
-		&ent.CompressedSize,
-		&createdAt,
-		&accessedAt,
-	)
-	if err != nil {
+	var createdAt int64
+	if err := row.Scan(&outputID, &ent.Size, &createdAt); err != nil {
 		return entry{}, err
 	}
 	ent.OutputID = hex.EncodeToString(outputID)
 	ent.CreatedAt = millisTime(createdAt)
-	ent.AccessedAt = millisTime(accessedAt)
 	return ent, nil
 }
 
-// touchEntries updates the access time of many entries in a single transaction,
-// reusing the prepared statement (bound to tx) so the update is parsed once.
-func (c *catalog) touchEntries(ctx context.Context, tx *sql.Tx, accessed map[string]int64) error {
-	if c.touchStmt == nil {
-		for actionID, accessedAt := range accessed {
-			if _, err := tx.ExecContext(ctx, touchEntrySQL, accessedAt, idKey(actionID)); err != nil {
-				return fmt.Errorf("touch entry: %w", err)
+// touchAccessed updates the access times a run has accumulated, in one
+// transaction. Entry times drive the age reaper and output times drive eviction,
+// so both have to move or one of the two stops seeing the cache being used.
+func (c *catalog) touchAccessed(ctx context.Context, tx *sql.Tx, entries, outputs map[string]int64) error {
+	if err := touchAll(ctx, tx, c.touchStmt, touchEntrySQL, entries); err != nil {
+		return fmt.Errorf("touch entry: %w", err)
+	}
+	if err := touchAll(ctx, tx, c.touchOutputStmt, touchOutputSQL, outputs); err != nil {
+		return fmt.Errorf("touch output: %w", err)
+	}
+	return nil
+}
+
+// touchAll binds the statement once for the whole batch rather than per row,
+// which is the point of doing these in one transaction.
+func touchAll(ctx context.Context, tx *sql.Tx, stmt *sql.Stmt, query string, accessed map[string]int64) error {
+	if len(accessed) == 0 {
+		return nil
+	}
+	if stmt == nil {
+		for id, accessedAt := range accessed {
+			if _, err := tx.ExecContext(ctx, query, accessedAt, idKey(id)); err != nil {
+				return err
 			}
 		}
 		return nil
 	}
-	stmt := tx.StmtContext(ctx, c.touchStmt)
-	defer stmt.Close() //nolint:errcheck
-	for actionID, accessedAt := range accessed {
-		if _, err := stmt.ExecContext(ctx, accessedAt, idKey(actionID)); err != nil {
-			return fmt.Errorf("touch entry: %w", err)
+	bound := tx.StmtContext(ctx, stmt)
+	defer bound.Close() //nolint:errcheck
+	for id, accessedAt := range accessed {
+		if _, err := bound.ExecContext(ctx, accessedAt, idKey(id)); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// deleteEntriesByOutputID removes every entry for an output unconditionally. That
-// is right for a blob found corrupt or missing, where the entries have to go
-// whatever their age; eviction wants evictEntriesByOutputID instead.
-func (c *catalog) deleteEntriesByOutputID(ctx context.Context, outputID string) error {
-	_, err := c.db.ExecContext(ctx, `
-DELETE FROM entries
-WHERE output_id = ?`, idKey(outputID))
+// dropAction forgets one action and the output it named, for a blob found corrupt
+// or missing.
+//
+// Only this action is deleted, not every action sharing the output. There is no
+// index from output back to actions — that is the point of the soft reference —
+// so "every action for this output" would mean scanning the whole table on a
+// cache miss. Dropping the output row is what matters: the blob stops being
+// referenced, and any sibling action becomes a dangling entry that costs one
+// primary-key delete when it is next asked for.
+func (c *catalog) dropAction(ctx context.Context, actionID, outputID string) error {
+	if _, err := c.db.ExecContext(ctx, `DELETE FROM outputs WHERE output_id = ?`, idKey(outputID)); err != nil {
+		return err
+	}
+	_, err := c.db.ExecContext(ctx, `DELETE FROM entries WHERE action_id = ?`, idKey(actionID))
 	return err
 }
 
-// evictEntriesByOutputID removes an output's entries only if nothing has read it
-// since it was chosen. Candidate selection and deletion are separated by the whole
-// planning walk, and a build that ran in between flushes its reads on the way out,
-// so without this an output picked as the coldest in the cache is deleted even
-// after becoming the hottest.
+// evictOutput removes an output from the inventory, but only if nothing has read
+// it since it was chosen. Candidate selection and deletion are separated by the
+// whole planning walk, and a build that ran in between flushes its reads on the
+// way out, so without the re-assert an output picked as the coldest in the cache
+// is deleted after becoming the hottest.
 //
-// It has to be all or nothing. Deleting the actions that are still cold while
-// leaving a warm one behind would report rows affected, the caller would unlink the
-// blob, and the surviving rows would point at nothing.
-func (c *catalog) evictEntriesByOutputID(ctx context.Context, outputID string, accessedAt int64) (int64, error) {
+// The caller may unlink the blob only when this reports true.
+func (c *catalog) evictOutput(ctx context.Context, outputID string, accessedAt int64) (bool, error) {
 	res, err := c.db.ExecContext(ctx, `
-DELETE FROM entries
-WHERE output_id = ?
-  AND NOT EXISTS (
-    SELECT 1 FROM entries newer
-    WHERE newer.output_id = ? AND newer.accessed_at > ?
-  )`, idKey(outputID), idKey(outputID), accessedAt)
+DELETE FROM outputs
+WHERE output_id = ? AND accessed_at <= ?`, idKey(outputID), accessedAt)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	return rows > 0, err
+}
+
+// deleteAccessedBefore expires both tables. outputs is the one that frees disk:
+// its rows are what keeps a blob from being an orphan, so an implementation that
+// reaped only entries would leave maxAge quietly reclaiming nothing.
+func (c *catalog) deleteAccessedBefore(ctx context.Context, cutoff int64) (reaped, error) {
+	entries, err := deleteAccessedBeforeIn(ctx, c.db, "entries", cutoff)
+	if err != nil {
+		return reaped{}, err
+	}
+	outputs, err := deleteAccessedBeforeIn(ctx, c.db, "outputs", cutoff)
+	if err != nil {
+		return reaped{}, err
+	}
+	return reaped{entries: entries, outputs: outputs}, nil
+}
+
+// reaped counts what an age pass removed from each table.
+type reaped struct {
+	entries int64
+	outputs int64
+}
+
+func deleteAccessedBeforeIn(ctx context.Context, db catalogDB, table string, cutoff int64) (int64, error) {
+	// table is one of two literals above, never caller input.
+	res, err := db.ExecContext(ctx, "DELETE FROM "+table+" WHERE accessed_at < ?", cutoff)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
 
-func (c *catalog) deleteEntriesAccessedBefore(ctx context.Context, cutoff int64) (int64, error) {
-	res, err := c.db.ExecContext(ctx, `
-DELETE FROM entries
-WHERE accessed_at < ?`, cutoff)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-// oldestAccess returns the least recent access time in the catalog, or ok=false
-// when there are no entries. entries_accessed_at makes this a seek, so callers
-// can decide whether an age-based delete has anything to match before doing the
-// scan it would cost.
+// oldestAccess returns the least recent access time in either table, or ok=false
+// when the catalog is empty. Both are index-backed seeks, so callers can decide
+// whether an age-based delete has anything to match before paying for its scan.
 func (c *catalog) oldestAccess(ctx context.Context) (int64, bool, error) {
 	var oldest sql.NullInt64
-	if err := c.db.QueryRowContext(ctx, `SELECT MIN(accessed_at) FROM entries`).Scan(&oldest); err != nil {
+	if err := c.db.QueryRowContext(ctx, `
+SELECT MIN(oldest) FROM (
+	SELECT MIN(accessed_at) AS oldest FROM entries
+	UNION ALL
+	SELECT MIN(accessed_at) FROM outputs
+)`).Scan(&oldest); err != nil {
 		return 0, false, err
 	}
 	return oldest.Int64, oldest.Valid, nil
@@ -282,31 +361,21 @@ func (c *catalog) oldestAccess(ctx context.Context) (int64, bool, error) {
 
 func (c *catalog) compressedSize(ctx context.Context) (int64, error) {
 	var size int64
-	err := c.db.QueryRowContext(ctx, `
-SELECT CAST(COALESCE(SUM(compressed_size), 0) AS INTEGER)
-FROM (
-	SELECT output_id, MAX(compressed_size) AS compressed_size
-	FROM entries
-	GROUP BY output_id
-)`).Scan(&size)
+	err := c.db.QueryRowContext(ctx,
+		`SELECT CAST(COALESCE(SUM(compressed_size), 0) AS INTEGER) FROM outputs`).Scan(&size)
 	return size, err
 }
 
-// outputStats totals what status reports without materialising a row per output.
-// It mirrors listOutputs' grouping — one row per output_id, taking MAX of each
-// size — because several actions can map to one output and its bytes are on disk
-// once. A cache with 267,900 outputs was loading all of them to add up two
-// columns.
+// outputStats totals what status reports. One row per blob is exactly what the
+// inventory holds, so this is a table scan of a few hundred thousand rows rather
+// than the GROUP BY over millions of entries it replaced.
 func (c *catalog) outputStats(ctx context.Context) (int64, int64, int64, error) {
 	var count, size, compressedSize int64
 	err := c.db.QueryRowContext(ctx, `
 SELECT COUNT(*),
        CAST(COALESCE(SUM(size), 0) AS INTEGER),
        CAST(COALESCE(SUM(compressed_size), 0) AS INTEGER)
-FROM (
-	SELECT MAX(size) AS size, MAX(compressed_size) AS compressed_size
-	FROM entries GROUP BY output_id
-)`).Scan(&count, &size, &compressedSize)
+FROM outputs`).Scan(&count, &size, &compressedSize)
 	return count, size, compressedSize, err
 }
 
@@ -316,13 +385,10 @@ FROM (
 // reporting a stale answer.
 func (c *catalog) listOutputs(ctx context.Context) ([]catalogOutput, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT output_id,
-       CAST(MAX(size) AS INTEGER),
-       CAST(MAX(compressed_size) AS INTEGER),
-       MAX(CASE WHEN blob_type_version = ? THEN blob_type END),
-       MAX(CASE WHEN retained_type_version = ? THEN retained_type END)
-FROM entries
-GROUP BY output_id`, blobClassifierVersion, retainedClassifierVersion)
+SELECT output_id, size, compressed_size,
+       CASE WHEN blob_type_version = ? THEN blob_type END,
+       CASE WHEN retained_type_version = ? THEN retained_type END
+FROM outputs`, blobClassifierVersion, retainedClassifierVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -346,22 +412,22 @@ GROUP BY output_id`, blobClassifierVersion, retainedClassifierVersion)
 }
 
 const referencedOutputsSQL = `
-SELECT DISTINCT output_id
-FROM entries
+SELECT output_id
+FROM outputs
 WHERE output_id >= ? AND output_id < ? AND accessed_at >= ?`
 
 // The last shard has no successor byte to stop before. BLOBs compare by content
 // with the shorter one first, so every key beginning 0xff sorts at or above the
 // single byte 0xff, and no other key does.
 const referencedOutputsTailSQL = `
-SELECT DISTINCT output_id
-FROM entries
+SELECT output_id
+FROM outputs
 WHERE output_id >= ? AND accessed_at >= ?`
 
-// referencedOutputIDs replaces outputIDs with the outputs referenced by entries
-// whose ID starts with the shard byte. Entries accessed before minAccessedAt are
-// ignored, which lets a scan plan around the entries it is about to delete; pass
-// keepEveryEntry to count all of them.
+// referencedOutputIDs replaces outputIDs with the inventoried outputs whose ID
+// starts with the shard byte. Outputs accessed before minAccessedAt are ignored,
+// which lets a scan plan around the rows it is about to reap; pass keepEveryOutput
+// to count all of them.
 func (c *catalog) referencedOutputIDs(ctx context.Context, shard int, minAccessedAt int64, outputIDs map[string]struct{}) error {
 	query, args := referencedOutputsSQL, []any{
 		[]byte{byte(shard)}, []byte{byte(shard + 1)}, minAccessedAt,
@@ -387,12 +453,12 @@ func (c *catalog) referencedOutputIDs(ctx context.Context, shard int, minAccesse
 }
 
 const updateBlobTypeSQL = `
-UPDATE entries
+UPDATE outputs
 SET blob_type = ?, blob_type_version = ?
 WHERE output_id = ?`
 
 const updateRetainedTypeSQL = `
-UPDATE entries
+UPDATE outputs
 SET retained_type = ?, retained_type_version = ?
 WHERE output_id = ?`
 
@@ -497,42 +563,24 @@ func commitClassifications[K ~int](ctx context.Context, db *sql.DB, stmt *sql.St
 	return nil
 }
 
-// oldestAccessWatermark reports the access time of the limit'th entry at or
-// after from, which is how far a bounded eviction step advances. ok is false
-// when fewer than one entry remains.
+// evictionCandidates returns the coldest inventoried outputs accessed at or after
+// from, least recently used first, at most limit of them.
 //
-// entries_accessed_at makes this a range scan with no sort.
-func (c *catalog) oldestAccessWatermark(ctx context.Context, from int64, limit int) (int64, bool, error) {
-	var watermark sql.NullInt64
-	err := c.db.QueryRowContext(ctx, `
-SELECT MAX(accessed_at) FROM (
-	SELECT accessed_at
-	FROM entries
-	WHERE accessed_at >= ?
-	ORDER BY accessed_at
-	LIMIT ?
-)`, from, limit).Scan(&watermark)
-	if err != nil {
-		return 0, false, err
-	}
-	return watermark.Int64, watermark.Valid, nil
-}
-
-// evictionCandidates returns the outputs whose *newest* access falls in
-// [from, watermark], least recently used first — the outputs entirely contained
-// in the region an eviction step has walked. An output with a fresher entry
-// elsewhere is deliberately absent: it is not actually old, and a later step
-// reaches it when the walk gets to that entry.
-func (c *catalog) evictionCandidates(ctx context.Context, from, watermark int64) ([]pruneCandidate, error) {
+// This is a range scan of outputs_accessed_at. It replaced a loop that walked
+// entries in bounded steps, taking a GROUP BY and a sort per step, because there
+// is no longer a set of aliases to collapse before the oldest output can be named.
+//
+// Outputs sharing the last row's access time may be left for the next page and so
+// missed by this pass. That only ever yields fewer candidates than ideal, which
+// evictToMaxSize already tolerates — it re-reads the real total and stops at the
+// budget either way.
+func (c *catalog) evictionCandidates(ctx context.Context, from int64, limit int) ([]pruneCandidate, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT output_id, CAST(MAX(compressed_size) AS INTEGER), MAX(accessed_at)
-FROM entries
-WHERE output_id IN (
-	SELECT output_id FROM entries WHERE accessed_at >= ? AND accessed_at <= ?
-)
-GROUP BY output_id
-HAVING MAX(accessed_at) <= ?
-ORDER BY MAX(accessed_at)`, from, watermark, watermark)
+SELECT output_id, compressed_size, accessed_at
+FROM outputs
+WHERE accessed_at >= ?
+ORDER BY accessed_at
+LIMIT ?`, from, limit)
 	if err != nil {
 		return nil, err
 	}

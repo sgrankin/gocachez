@@ -31,33 +31,50 @@ const cacheSchemaVersion = 2
 // the version in the path lets an older binary of the same version open the
 // result; anything else bumps cacheSchemaVersion.
 //
+// outputs is the inventory of what is on disk: one row per blob, holding the facts
+// that belong to the content rather than to any action that produced it. entries
+// maps actions onto it.
+//
+// The reference is deliberately soft — no foreign key, and no index from an output
+// back to the actions naming it. A dangling entry is just a miss, which get
+// already handles for a blob that went missing, and that costs far less than the
+// reverse index would: eviction and classification would otherwise fan out over
+// the 29 actions a production cache maps onto each output, and answering "how big
+// is the cache" meant a GROUP BY over every entry in it.
+//
+// entries.size is denormalised from outputs so a cache hit stays one primary-key
+// seek with no join.
+//
 // IDs are stored as the raw digest rather than the 64-character hex that Go uses
-// for paths. Hex doubles all three copies of every key — the row, the primary-key
-// b-tree, and the covering index — and a production catalog spent 650MiB on the
-// key index alone. WITHOUT ROWID removes that third copy entirely by making the
-// table its own primary-key b-tree.
+// for paths. Hex doubles every copy of every key, and a production catalog spent
+// 650MiB on the key index alone. WITHOUT ROWID removes that index entirely by
+// making each table its own primary-key b-tree.
 //
 // STRICT is what keeps that decision honest. Without it a hex string bound to a
-// BLOB column is stored as TEXT and simply never compares equal to the key it was
-// meant to be, so the row is invisible rather than wrong, and nothing reports a
-// problem. STRICT turns that into "cannot store TEXT value in BLOB column".
+// BLOB column is stored as TEXT and never compares equal to the key it was meant
+// to be, so the row is invisible rather than wrong and nothing reports a problem.
+// STRICT turns that into "cannot store TEXT value in BLOB column".
 const catalogSchema = `
-CREATE TABLE IF NOT EXISTS entries (
-	action_id BLOB PRIMARY KEY,
-	output_id BLOB NOT NULL,
+CREATE TABLE IF NOT EXISTS outputs (
+	output_id BLOB PRIMARY KEY,
 	size INTEGER NOT NULL,
 	compressed_size INTEGER NOT NULL,
-	created_at INTEGER NOT NULL,
 	accessed_at INTEGER NOT NULL,
 	blob_type INTEGER,
 	blob_type_version INTEGER,
 	retained_type INTEGER,
 	retained_type_version INTEGER
 ) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS outputs_accessed_at ON outputs(accessed_at, compressed_size);
+
+CREATE TABLE IF NOT EXISTS entries (
+	action_id BLOB PRIMARY KEY,
+	output_id BLOB NOT NULL,
+	size INTEGER NOT NULL,
+	created_at INTEGER NOT NULL,
+	accessed_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS entries_accessed_at ON entries(accessed_at);
-CREATE INDEX IF NOT EXISTS entries_output_cover ON entries(
-	output_id, size, compressed_size,
-	blob_type, blob_type_version, retained_type, retained_type_version);
 
 CREATE TABLE IF NOT EXISTS runs (
 	run_id TEXT PRIMARY KEY,
@@ -94,6 +111,7 @@ type store struct {
 	liveWriterPool    sync.Pool
 	materialized      map[string]string
 	accessed          map[string]int64
+	accessedOutputs   map[string]int64
 	accessFlushed     time.Time
 	// installed counts compressed bytes this run put, so a build large enough
 	// to overshoot maxSize can force a maintenance scan on the way out instead
@@ -271,6 +289,7 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 		runLock:           runLock,
 		materialized:      make(map[string]string),
 		accessed:          make(map[string]int64),
+		accessedOutputs:   make(map[string]int64),
 		accessFlushed:     time.Now(),
 	}
 	if err := st.q.prepare(context.Background()); err != nil {

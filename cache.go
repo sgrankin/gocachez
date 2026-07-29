@@ -222,7 +222,7 @@ func (st *store) get(req request) (response, error) {
 		path, err = st.materialize(ent)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, errInvalidCacheEntry) {
-				if deleteErr := st.deleteOutput(ent.OutputID); deleteErr != nil && st.verbose {
+				if deleteErr := st.dropAction(actionHex, ent.OutputID); deleteErr != nil && st.verbose {
 					log.Printf("gocachez: delete bad cache output failed: %v", deleteErr)
 				}
 				return response{ID: req.ID, Miss: true}, nil
@@ -232,7 +232,7 @@ func (st *store) get(req request) (response, error) {
 		st.setMaterialized(ent.OutputID, path)
 	}
 
-	st.markEntryAccess(actionHex)
+	st.markEntryAccess(actionHex, ent.OutputID)
 
 	return response{
 		ID:       req.ID,
@@ -261,10 +261,11 @@ func (st *store) deleteMaterialized(outputID string) {
 	delete(st.materialized, outputID)
 }
 
-func (st *store) markEntryAccess(actionID string) {
+func (st *store) markEntryAccess(actionID, outputID string) {
 	now := time.Now()
 	st.mu.Lock()
 	st.accessed[actionID] = unixMillis(now)
+	st.accessedOutputs[outputID] = unixMillis(now)
 	// Claim the flush while holding the lock, so concurrent gets do not each open
 	// a transaction for the same batch.
 	due := now.Sub(st.accessFlushed) >= accessFlushInterval
@@ -285,10 +286,11 @@ func (st *store) markEntryAccess(actionID string) {
 
 func (st *store) flushAccessTimes() error {
 	st.mu.Lock()
-	accessed := st.accessed
+	accessed, accessedOutputs := st.accessed, st.accessedOutputs
 	st.accessed = make(map[string]int64)
+	st.accessedOutputs = make(map[string]int64)
 	st.mu.Unlock()
-	if len(accessed) == 0 {
+	if len(accessed) == 0 && len(accessedOutputs) == 0 {
 		return nil
 	}
 
@@ -297,7 +299,7 @@ func (st *store) flushAccessTimes() error {
 	if err != nil {
 		return fmt.Errorf("begin access-time transaction: %w", err)
 	}
-	if err := st.q.touchEntries(ctx, tx, accessed); err != nil {
+	if err := st.q.touchAccessed(ctx, tx, accessed, accessedOutputs); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -466,12 +468,12 @@ func (st *store) lookupEntry(actionID string) (entry, error) {
 	return st.q.lookupEntry(context.Background(), actionID)
 }
 
-func (st *store) deleteOutput(outputID string) error {
+func (st *store) dropAction(actionID, outputID string) error {
 	if err := os.Remove(st.blobPath(outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove bad blob: %w", err)
 	}
-	if err := st.q.deleteEntriesByOutputID(context.Background(), outputID); err != nil {
-		return fmt.Errorf("delete bad output entries: %w", err)
+	if err := st.q.dropAction(context.Background(), actionID, outputID); err != nil {
+		return fmt.Errorf("drop bad output: %w", err)
 	}
 	st.deleteMaterialized(outputID)
 	return nil
@@ -760,8 +762,8 @@ func (st *store) planPrune(now time.Time) (prunePlan, error) {
 	if plan.blobs, err = st.planToMaxSize(plan.entryCutoff); err != nil {
 		return prunePlan{}, err
 	}
-	// Entries this scan is about to delete must not count as references, or the
-	// blobs they were the last holder of would survive until the next scan.
+	// Inventory rows this scan is about to reap must not count as references, or
+	// the blobs they account for would survive until the next scan.
 	if plan.orphans, err = st.planOrphans(true, plan.entryCutoff); err != nil {
 		return prunePlan{}, err
 	}
@@ -830,12 +832,10 @@ func (st *store) deletePlanned(plan prunePlan) error {
 // planToMaxSize lists blobs to evict, least recently used first, or nothing if
 // the cache is within budget.
 //
-// It walks entries_accessed_at oldest-first in bounded steps and stops once it
-// has enough candidates to cover the overshoot, rather than ordering the whole
-// catalog. Exact LRU cost a full GROUP BY plus a sort — 344ms and 200k rows at
-// 200k outputs — to rank candidates that in a cache with high key churn are
-// almost all equally dead. Overshooting the estimate is harmless: evictToMaxSize
-// re-reads the real size and stops at the budget.
+// It pages outputs_accessed_at oldest-first and stops once it has enough
+// candidates to cover the overshoot, rather than ordering the whole inventory.
+// Overshooting the estimate is harmless: evictToMaxSize re-reads the real size and
+// stops at the budget.
 func (st *store) planToMaxSize(entryCutoff int64) ([]pruneCandidate, error) {
 	if st.maxSize <= 0 {
 		return nil, nil
@@ -856,16 +856,12 @@ func (st *store) planToMaxSize(entryCutoff int64) ([]pruneCandidate, error) {
 	need := total - st.maxSize
 	var candidates []pruneCandidate
 	for need > 0 {
-		watermark, ok, err := st.q.oldestAccessWatermark(ctx, cursor, evictionSampleSize)
-		if err != nil {
-			return nil, fmt.Errorf("find eviction watermark: %w", err)
-		}
-		if !ok {
-			break
-		}
-		batch, err := st.q.evictionCandidates(ctx, cursor, watermark)
+		batch, err := st.q.evictionCandidates(ctx, cursor, evictionSampleSize)
 		if err != nil {
 			return nil, fmt.Errorf("query eviction candidates: %w", err)
+		}
+		if len(batch) == 0 {
+			break
 		}
 		for _, candidate := range batch {
 			candidates = append(candidates, candidate)
@@ -874,9 +870,9 @@ func (st *store) planToMaxSize(entryCutoff int64) ([]pruneCandidate, error) {
 				break
 			}
 		}
-		// Past the watermark, so a step whose outputs all had fresher entries
-		// still makes progress instead of re-reading the same region.
-		cursor = watermark + 1
+		// Past the last row taken, so the next page makes progress rather than
+		// re-reading this one.
+		cursor = batch[len(batch)-1].accessedAt + 1
 	}
 	return candidates, nil
 }
@@ -905,14 +901,14 @@ func (st *store) evictToMaxSize(candidates []pruneCandidate) ([]string, error) {
 		// would end the loop early and leave the cache over budget — which is
 		// the whole point of eviction. The blobs are not leaked: an output with
 		// no surviving entries is in plan.orphans.
-		rows, err := st.q.evictEntriesByOutputID(context.Background(), candidate.outputID, candidate.accessedAt)
+		removed, err := st.q.evictOutput(context.Background(), candidate.outputID, candidate.accessedAt)
 		if err != nil {
-			return nil, fmt.Errorf("delete pruned entries: %w", err)
+			return nil, fmt.Errorf("evict output: %w", err)
 		}
-		// Either the entries were already gone, or something read the output since
-		// it was chosen and it is no longer a candidate. Neither credits bytes, and
-		// neither may unlink the blob.
-		if rows == 0 {
+		// Either the row was already gone, or something read the output since it was
+		// chosen and it is no longer a candidate. Neither credits bytes, and neither
+		// may unlink the blob.
+		if !removed {
 			continue
 		}
 		if err := os.Remove(st.blobPath(candidate.outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -927,10 +923,10 @@ func (st *store) evictToMaxSize(candidates []pruneCandidate) ([]string, error) {
 	return evicted, nil
 }
 
-// keepEveryEntry disables the access-time filter in referencedInShard. Zero
+// keepEveryOutput disables the access-time filter in referencedInShard. Zero
 // would not do: accessed_at can be negative if the clock was ever behind 1970,
 // and pruneDue already anticipates a skewed clock.
-const keepEveryEntry = math.MinInt64
+const keepEveryOutput = math.MinInt64
 
 type pruneCandidate struct {
 	outputID string
@@ -971,12 +967,13 @@ func (st *store) pruneOldEntries(cutoff int64) error {
 	if cutoff == 0 {
 		return nil
 	}
-	removed, err := st.q.deleteEntriesAccessedBefore(context.Background(), cutoff)
+	reaped, err := st.q.deleteAccessedBefore(context.Background(), cutoff)
 	if err != nil {
 		return fmt.Errorf("prune old entries: %w", err)
 	}
-	if st.verbose && removed > 0 {
-		log.Printf("gocachez: pruned %d entries not used in %s", removed, st.maxAge)
+	if st.verbose && (reaped.entries > 0 || reaped.outputs > 0) {
+		log.Printf("gocachez: pruned %d entries and %d outputs not used in %s",
+			reaped.entries, reaped.outputs, st.maxAge)
 	}
 	return nil
 }
@@ -1152,7 +1149,7 @@ func (st *store) removeOrphans(orphans map[int][]string) error {
 		// cache does no work here at all.
 		// pruneOldEntries has already run, so nothing is below the cutoff any
 		// more and an unfiltered query is both simpler and the honest check.
-		if err := st.referencedInShard(shard, keepEveryEntry, referenced); err != nil {
+		if err := st.referencedInShard(shard, keepEveryOutput, referenced); err != nil {
 			return err
 		}
 		for _, path := range orphans[shard] {

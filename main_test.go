@@ -528,7 +528,7 @@ func TestClassificationSurvivesAnIncompletePass(t *testing.T) {
 		defer db.Close() //nolint:errcheck
 		var n int
 		if err := db.QueryRowContext(context.Background(),
-			`SELECT COUNT(*) FROM entries WHERE blob_type IS NOT NULL`).Scan(&n); err != nil {
+			`SELECT COUNT(*) FROM outputs WHERE blob_type IS NOT NULL`).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		return n
@@ -1174,7 +1174,8 @@ func TestPruneRemovesOrphanRetainedFiles(t *testing.T) {
 	if _, err := os.Stat(exportPath); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.q.deleteEntriesByOutputID(context.Background(), hexOf(outputID)); err != nil {
+	if _, err := st.db.ExecContext(context.Background(),
+		`DELETE FROM outputs WHERE output_id = ?`, idKey(hexOf(outputID))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
@@ -1554,11 +1555,21 @@ func TestPruneRemovesUnusedBlobs(t *testing.T) {
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.lookupEntry(hexOf(actionID)); !errorsIs(err, sql.ErrNoRows) {
-		t.Fatalf("entry was not pruned: %v", err)
-	}
 	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
 		t.Fatalf("blob was not pruned: %v", err)
+	}
+	// The entry may outlive the blob — nothing indexes output back to action, so
+	// eviction cannot find it. What has to hold is that it stops being a hit, and
+	// that asking cleans it up.
+	res, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Miss {
+		t.Fatalf("get response = %+v after eviction, want miss", res)
+	}
+	if _, err := st.lookupEntry(hexOf(actionID)); !errorsIs(err, sql.ErrNoRows) {
+		t.Fatalf("a missed entry was not cleaned up: %v", err)
 	}
 }
 
@@ -1726,7 +1737,7 @@ func TestEvictionKeepsAnOutputReadDuringPlanning(t *testing.T) {
 	// arbitrary and the coldest candidate is a known output.
 	for i, output := range outputs {
 		if _, err := st.db.ExecContext(context.Background(),
-			`UPDATE entries SET accessed_at = ? WHERE output_id = ?`,
+			`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`,
 			unixMillis(time.Now())-int64(len(outputs)-i)*1000, idKey(hexOf(output))); err != nil {
 			t.Fatal(err)
 		}
@@ -1752,7 +1763,7 @@ func TestEvictionKeepsAnOutputReadDuringPlanning(t *testing.T) {
 	// A build reads the coldest output and exits, flushing the access — exactly
 	// what the periodic flush now makes visible mid-pass.
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`,
+		`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`,
 		unixMillis(time.Now()), idKey(coldest)); err != nil {
 		t.Fatal(err)
 	}
@@ -1767,7 +1778,7 @@ func TestEvictionKeepsAnOutputReadDuringPlanning(t *testing.T) {
 	}
 	var surviving int
 	if err := st.db.QueryRowContext(context.Background(),
-		`SELECT COUNT(*) FROM entries WHERE output_id = ?`, idKey(coldest)).Scan(&surviving); err != nil {
+		`SELECT COUNT(*) FROM outputs WHERE output_id = ?`, idKey(coldest)).Scan(&surviving); err != nil {
 		t.Fatal(err)
 	}
 	if surviving == 0 {
@@ -1788,7 +1799,7 @@ func TestEvictionKeepsAnOutputReadDuringPlanning(t *testing.T) {
 // row: deleting the actions that are still cold while a warm one survives reports
 // rows affected, so the caller unlinks the blob and leaves that row pointing at
 // nothing — a hit that resolves to a missing file.
-func TestEvictionKeepsAnOutputWhoseOtherActionWentWarm(t *testing.T) {
+func TestEvictionKeepsAnOutputReadWhilePlanning(t *testing.T) {
 	t.Parallel()
 
 	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge})
@@ -1799,7 +1810,6 @@ func TestEvictionKeepsAnOutputWhoseOtherActionWentWarm(t *testing.T) {
 
 	shared := sha256.Sum256([]byte("shared-output"))
 	body := incompressibleBody(t, 8192, 99)
-	twoActions := make([][]byte, 0, 2)
 	for i := range 2 {
 		action := sha256.Sum256(fmt.Appendf(nil, "shared-action-%d", i))
 		if _, err := st.put(request{
@@ -1808,7 +1818,6 @@ func TestEvictionKeepsAnOutputWhoseOtherActionWentWarm(t *testing.T) {
 		}, bufio.NewReader(encodedBody(body))); err != nil {
 			t.Fatal(err)
 		}
-		twoActions = append(twoActions, action[:])
 	}
 	// A second, warmer output so there is something else to evict and the budget
 	// is reachable without the shared one.
@@ -1824,11 +1833,11 @@ func TestEvictionKeepsAnOutputWhoseOtherActionWentWarm(t *testing.T) {
 
 	now := unixMillis(time.Now())
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`, now-10_000, idKey(hexOf(shared[:]))); err != nil {
+		`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`, now-10_000, idKey(hexOf(shared[:]))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`, now, idKey(hexOf(other[:]))); err != nil {
+		`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`, now, idKey(hexOf(other[:]))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
@@ -1848,9 +1857,11 @@ func TestEvictionKeepsAnOutputWhoseOtherActionWentWarm(t *testing.T) {
 		t.Fatalf("expected the shared output to be the coldest candidate, got %v", plan.blobs)
 	}
 
-	// One of its two actions is read and flushed while the plan is in hand.
+	// It is read and flushed while the plan is in hand, which moves the output's
+	// clock past what the plan recorded.
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, now+10_000, idKey(hexOf(twoActions[0]))); err != nil {
+		`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`,
+		now+10_000, idKey(hexOf(shared[:]))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1861,7 +1872,7 @@ func TestEvictionKeepsAnOutputWhoseOtherActionWentWarm(t *testing.T) {
 
 	var surviving int
 	if err := st.db.QueryRowContext(context.Background(),
-		`SELECT COUNT(*) FROM entries WHERE output_id = ?`, idKey(hexOf(shared[:]))).Scan(&surviving); err != nil {
+		`SELECT COUNT(*) FROM outputs WHERE output_id = ?`, idKey(hexOf(shared[:]))).Scan(&surviving); err != nil {
 		t.Fatal(err)
 	}
 	if surviving == 0 {
@@ -2713,7 +2724,7 @@ func TestPruneRemovesRetainedFilesOfEvictedOutputs(t *testing.T) {
 	}
 	defer st.close()
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`,
+		`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`,
 		unixMillis(time.Now().Add(-time.Hour)), idKey(hexOf(evicted))); err != nil {
 		t.Fatal(err)
 	}
@@ -3070,18 +3081,15 @@ func TestCatalogQueriesRespectCanceledContext(t *testing.T) {
 	if _, err := st.q.evictionCandidates(ctx, 0, 1); err == nil {
 		t.Fatal("evictionCandidates succeeded with canceled context")
 	}
-	if _, _, err := st.q.oldestAccessWatermark(ctx, 0, 1); err == nil {
-		t.Fatal("oldestAccessWatermark succeeded with canceled context")
-	}
-	if err := st.q.referencedOutputIDs(ctx, 0, keepEveryEntry, make(map[string]struct{})); err == nil {
+	if err := st.q.referencedOutputIDs(ctx, 0, keepEveryOutput, make(map[string]struct{})); err == nil {
 		t.Fatal("referencedOutputIDs succeeded with canceled context")
 	}
 }
 
-// The point of walking entries_accessed_at is that one step costs a bounded
-// amount regardless of how big the cache is. Correctness does not depend on it —
-// an unbounded step still evicts the right things — so it needs asserting
-// directly or a regression would be invisible.
+// The point of paging outputs_accessed_at is that one step costs a bounded amount
+// regardless of how big the cache is. Correctness does not depend on it — an
+// unbounded step still evicts the right things — so it needs asserting directly or
+// a regression would be invisible.
 func TestEvictionStepStaysBounded(t *testing.T) {
 	t.Parallel()
 
@@ -3103,10 +3111,17 @@ func TestEvictionStepStaysBounded(t *testing.T) {
 		output := sha256.Sum256(fmt.Appendf(nil, "bounded-output-%d", i))
 		// Distinct access times, so no step has to over-reach to avoid splitting
 		// a timestamp.
+		accessedAt := now - int64(outputs) + int64(i)
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
-			 VALUES (?, ?, 1, 1, ?, ?)`,
-			action[:], output[:], now, now-int64(outputs)+int64(i),
+			`INSERT INTO outputs(output_id, size, compressed_size, accessed_at) VALUES (?, 1, 1, ?)`,
+			output[:], accessedAt,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO entries(action_id, output_id, size, created_at, accessed_at)
+			 VALUES (?, ?, 1, ?, ?)`,
+			action[:], output[:], now, accessedAt,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -3115,14 +3130,7 @@ func TestEvictionStepStaysBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	watermark, ok, err := st.q.oldestAccessWatermark(ctx, 0, evictionSampleSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("no watermark for a catalog with entries")
-	}
-	candidates, err := st.q.evictionCandidates(ctx, 0, watermark)
+	candidates, err := st.q.evictionCandidates(ctx, 0, evictionSampleSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3135,11 +3143,11 @@ func TestEvictionStepStaysBounded(t *testing.T) {
 	}
 }
 
-// Eviction walks entries_accessed_at in bounded steps, so both of the things
-// asserted here need a cache larger than one step: that the walk keeps advancing
-// until the budget is met, and that an output straddling a step boundary — old
-// entry inside it, fresh entry beyond — is ranked by its newest access and so
-// outlives outputs that are old by every measure.
+// Eviction pages outputs_accessed_at, so both of the things asserted here need a
+// cache larger than one page: that the walk keeps advancing until the budget is
+// met, and that an output read recently outlives outputs that are old by every
+// measure, even though an ancient entry still names it. The second is the soft
+// reference working — entry age must not drag an output down with it.
 func TestPruneEvictsAcrossStepsWithoutTakingFreshOutputs(t *testing.T) {
 	t.Parallel()
 
@@ -3165,8 +3173,8 @@ func TestPruneEvictsAcrossStepsWithoutTakingFreshOutputs(t *testing.T) {
 		}
 	}
 
-	// The straddler: two action IDs onto one output, and big enough that the
-	// budget below has room for it and nothing else.
+	// Two action IDs onto one output, big enough that the budget below has room for
+	// it and nothing else.
 	shared := bytes.Repeat([]byte{111}, 32)
 	oldAction := bytes.Repeat([]byte{112}, 32)
 	freshAction := bytes.Repeat([]byte{113}, 32)
@@ -3183,40 +3191,42 @@ func TestPruneEvictsAcrossStepsWithoutTakingFreshOutputs(t *testing.T) {
 		}
 	}
 
-	// Everything ancient except the straddler's second action, which stays at
-	// now — so its oldest entry sits in the first step and its newest does not.
-	// Distinct times: a step has to include every entry sharing its watermark, so
-	// identical timestamps would collapse the whole cache into one step and defeat
-	// the point of the test. The first byte of each action ID spreads them without
-	// needing a rowid, which a WITHOUT ROWID table does not have.
+	// Everything ancient, with distinct times so no single page can swallow the
+	// whole cache and defeat the point of the test. The first byte of the ID
+	// spreads them without needing a rowid, which a WITHOUT ROWID table lacks.
 	ancient := unixMillis(time.Now().Add(-90 * 24 * time.Hour))
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? + 1 + unicode(hex(substr(action_id, 1, 1))) WHERE action_id != ?`,
-		ancient, idKey(hexOf(freshAction))); err != nil {
+		`UPDATE outputs SET accessed_at = ? + 1 + unicode(hex(substr(output_id, 1, 1)))`, ancient); err != nil {
 		t.Fatal(err)
 	}
-	// Make the straddler's old entry the single oldest thing in the cache, so it
-	// falls inside the first step. Otherwise the first step never sees it and the
-	// ranking this test is about is never exercised.
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, ancient-1000, idKey(hexOf(oldAction))); err != nil {
+		`UPDATE entries SET accessed_at = ?`, ancient); err != nil {
+		t.Fatal(err)
+	}
+	// The shared output was read just now, while the entries naming it stay
+	// ancient: eviction must rank it by the output's own access time.
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`,
+		unixMillis(time.Now()), idKey(hexOf(shared))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
 
-	sharedEntry, err := st.lookupEntry(hexOf(freshAction))
-	if err != nil {
+	var sharedSize int64
+	if err := st.db.QueryRowContext(context.Background(),
+		`SELECT compressed_size FROM outputs WHERE output_id = ?`,
+		idKey(hexOf(shared))).Scan(&sharedSize); err != nil {
 		t.Fatal(err)
 	}
 	total, err := st.compressedSize()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Room for the straddler alone. Reaching that means evicting more of the
-	// ancient outputs than one step examines, so the walk has to take several.
-	st.maxSize = sharedEntry.CompressedSize * 3 / 2
+	// Room for the shared output alone. Reaching that means evicting more of the
+	// ancient outputs than one page examines, so the walk has to take several.
+	st.maxSize = sharedSize * 3 / 2
 	if total-st.maxSize <= 0 {
 		t.Fatal("cache is not over budget: nothing would be evicted")
 	}
@@ -3232,7 +3242,7 @@ func TestPruneEvictsAcrossStepsWithoutTakingFreshOutputs(t *testing.T) {
 		t.Fatalf("cache is %d bytes after eviction, over its %d budget", after, st.maxSize)
 	}
 	if _, err := os.Stat(st.blobPath(hexOf(shared))); err != nil {
-		t.Fatalf("evicted the output whose newest access was fresh: %v", err)
+		t.Fatalf("evicted the output that was read most recently: %v", err)
 	}
 }
 
@@ -3274,30 +3284,23 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 		}
 	}
 
+	// The shared output was read more recently than the other one, so the other is
+	// what eviction should take. Its two actions were read at different times; that
+	// no longer decides anything, because the output carries its own clock.
 	recent := unixMillis(time.Now())
-	if _, err := st.db.ExecContext(
-		context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
-		recent-3000,
-		idKey(hexOf(oldSharedActionID)),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.db.ExecContext(
-		context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
-		recent-1000,
-		hexOf(newSharedActionID),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.db.ExecContext(
-		context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
-		recent-2000,
-		idKey(hexOf(prunedActionID)),
-	); err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		outputID   []byte
+		accessedAt int64
+	}{
+		{sharedOutputID, recent - 1000},
+		{prunedOutputID, recent - 2000},
+	} {
+		if _, err := st.db.ExecContext(context.Background(),
+			`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`,
+			tc.accessedAt, idKey(hexOf(tc.outputID)),
+		); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	total, err := st.compressedSize()
@@ -3316,7 +3319,7 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := st.lookupEntry(hexOf(prunedActionID)); !errorsIs(err, sql.ErrNoRows) {
+	if _, err := os.Stat(st.blobPath(hexOf(prunedOutputID))); !os.IsNotExist(err) {
 		t.Fatalf("middle-aged blob was not pruned: %v", err)
 	}
 	if _, err := st.lookupEntry(hexOf(oldSharedActionID)); err != nil {
@@ -3382,6 +3385,14 @@ func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
 		); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// oldOutputID has no other action, so it went unread with its entry. The shared
+	// output stays fresh: its other action was read, which is what keeps the blob
+	// alive while the stale action's entry goes.
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`,
+		stale, idKey(hexOf(oldOutputID))); err != nil {
+		t.Fatal(err)
 	}
 
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
@@ -3483,14 +3494,16 @@ func TestAccessTimesFlushOnClose(t *testing.T) {
 	}, bufio.NewReader(encodedBody(body))); err != nil {
 		t.Fatal(err)
 	}
-	actionHex := hexOf(actionID)
-	if _, err := st.db.ExecContext(
-		context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
-		int64(1000),
-		idKey(actionHex),
-	); err != nil {
-		t.Fatal(err)
+	actionHex, outputHex := hexOf(actionID), hexOf(outputID)
+	for _, backdate := range []struct{ query, id string }{
+		{`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, actionHex},
+		{`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`, outputHex},
+	} {
+		if _, err := st.db.ExecContext(
+			context.Background(), backdate.query, int64(1000), idKey(backdate.id),
+		); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionID}); err != nil {
 		t.Fatal(err)
@@ -3498,16 +3511,23 @@ func TestAccessTimesFlushOnClose(t *testing.T) {
 	if err := st.flushAccessTimes(); err != nil {
 		t.Fatal(err)
 	}
-	var accessedAt int64
-	if err := st.db.QueryRowContext(
-		context.Background(),
-		`SELECT accessed_at FROM entries WHERE action_id = ?`,
-		idKey(actionHex),
-	).Scan(&accessedAt); err != nil {
-		t.Fatal(err)
-	}
-	if accessedAt <= 1000 {
-		t.Fatalf("accessed_at = %d, want > 1000", accessedAt)
+	// Both clocks, because they answer different questions: the entry's decides
+	// when the mapping expires, the output's decides what eviction takes. An
+	// output that is read constantly but never restamped is exactly what eviction
+	// would pick first.
+	for _, check := range []struct{ what, query, id string }{
+		{"entry", `SELECT accessed_at FROM entries WHERE action_id = ?`, actionHex},
+		{"output", `SELECT accessed_at FROM outputs WHERE output_id = ?`, outputHex},
+	} {
+		var accessedAt int64
+		if err := st.db.QueryRowContext(
+			context.Background(), check.query, idKey(check.id),
+		).Scan(&accessedAt); err != nil {
+			t.Fatal(err)
+		}
+		if accessedAt <= 1000 {
+			t.Fatalf("%s accessed_at = %d, want > 1000", check.what, accessedAt)
+		}
 	}
 }
 
@@ -3844,9 +3864,11 @@ func TestRunPruneDeletesInsideTheInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 	stale := unixMillis(trimCutoff(defaultMaxAge, time.Now())) - int64(time.Minute/time.Millisecond)
-	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ?`, stale); err != nil {
-		t.Fatal(err)
+	for _, table := range []string{"entries", "outputs"} {
+		if _, err := st.db.ExecContext(context.Background(),
+			`UPDATE `+table+` SET accessed_at = ?`, stale); err != nil {
+			t.Fatal(err)
+		}
 	}
 	blobPath := st.blobPath(hexOf(outputID))
 	// close both stamps the interval and leaves the cache idle, so nothing but an
@@ -4639,7 +4661,7 @@ func TestStatusReclassifiesWhenClassifierVersionChanges(t *testing.T) {
 	dbPath := filepath.Join(versionDir, "cache.db")
 
 	// Seed a wrong classification recorded under a different classifier version.
-	execCatalog(t, dbPath, `UPDATE entries SET blob_type = ?, blob_type_version = ?`,
+	execCatalog(t, dbPath, `UPDATE outputs SET blob_type = ?, blob_type_version = ?`,
 		int64(blobTypeText), int64(blobClassifierVersion+1))
 
 	statuses, err := readBlobTypeStatus(dbPath, blobsDir)
@@ -4650,7 +4672,7 @@ func TestStatusReclassifiesWhenClassifierVersionChanges(t *testing.T) {
 
 	// The stale value is recomputed and re-stored at the current version.
 	var kind, version sql.NullInt64
-	queryCatalog(t, dbPath, `SELECT blob_type, blob_type_version FROM entries WHERE output_id = ?`,
+	queryCatalog(t, dbPath, `SELECT blob_type, blob_type_version FROM outputs WHERE output_id = ?`,
 		[]any{idKey(hexOf(outputID))}, &kind, &version)
 	if !kind.Valid || blobTypeKind(kind.Int64) != blobTypeGoPackageArchive {
 		t.Fatalf("cached blob_type = %v, want %d", kind, blobTypeGoPackageArchive)
@@ -4687,7 +4709,7 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 
 	// New retained files are classified when they are created.
 	var kind, version sql.NullInt64
-	queryCatalog(t, dbPath, `SELECT retained_type, retained_type_version FROM entries WHERE output_id = ?`,
+	queryCatalog(t, dbPath, `SELECT retained_type, retained_type_version FROM outputs WHERE output_id = ?`,
 		[]any{idKey(outputHex)}, &kind, &version)
 	if !kind.Valid || retainedTypeKind(kind.Int64) != retainedTypeGeneratedCgoSource {
 		t.Fatalf("cached retained_type = %v, want %d", kind, retainedTypeGeneratedCgoSource)
@@ -4697,7 +4719,7 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 	}
 
 	// Simulate an older cache and verify status backfills its classification.
-	execCatalog(t, dbPath, `UPDATE entries SET retained_type = NULL, retained_type_version = NULL WHERE output_id = ?`, idKey(outputHex))
+	execCatalog(t, dbPath, `UPDATE outputs SET retained_type = NULL, retained_type_version = NULL WHERE output_id = ?`, idKey(outputHex))
 	_, _, outputs, err := readCatalogStatus(dbPath, true)
 	if err != nil {
 		t.Fatal(err)
@@ -4708,7 +4730,7 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 	}
 	assertRetainedKind(t, statuses, retainedTypeGeneratedCgoSource, 1)
 
-	queryCatalog(t, dbPath, `SELECT retained_type, retained_type_version FROM entries WHERE output_id = ?`,
+	queryCatalog(t, dbPath, `SELECT retained_type, retained_type_version FROM outputs WHERE output_id = ?`,
 		[]any{idKey(outputHex)}, &kind, &version)
 	if !kind.Valid || retainedTypeKind(kind.Int64) != retainedTypeGeneratedCgoSource {
 		t.Fatalf("backfilled retained_type = %v, want %d", kind, retainedTypeGeneratedCgoSource)
@@ -4733,7 +4755,7 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 	assertRetainedKind(t, statuses, retainedTypeGeneratedCgoSource, 1)
 }
 
-func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
+func TestPutKeepsOutputClassification(t *testing.T) {
 	t.Parallel()
 
 	st, err := newStore(config{dir: t.TempDir()})
@@ -4743,15 +4765,29 @@ func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
 	defer st.close()
 
 	ctx := context.Background()
-	actionID := hexOf(bytes.Repeat([]byte{1}, 32))
 	output1 := hexOf(bytes.Repeat([]byte{2}, 32))
 	output2 := hexOf(bytes.Repeat([]byte{3}, 32))
 	now := time.Now()
-	base := entry{ActionID: actionID, OutputID: output1, Size: 1, CompressedSize: 1, CreatedAt: now, AccessedAt: now}
-
-	if err := st.q.upsertEntry(ctx, base); err != nil {
-		t.Fatal(err)
+	put := func(actionID, outputID string) {
+		if err := st.q.upsertEntry(ctx, entry{
+			ActionID: actionID, OutputID: outputID,
+			Size: 1, CompressedSize: 1, CreatedAt: now, AccessedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
+	kindOf := func(outputID string) (sql.NullInt64, sql.NullInt64) {
+		var blobType, retainedType sql.NullInt64
+		if err := st.db.QueryRowContext(ctx,
+			`SELECT blob_type, retained_type FROM outputs WHERE output_id = ?`,
+			idKey(outputID)).Scan(&blobType, &retainedType); err != nil {
+			t.Fatal(err)
+		}
+		return blobType, retainedType
+	}
+
+	action := hexOf(bytes.Repeat([]byte{1}, 32))
+	put(action, output1)
 	if err := st.q.updateBlobType(ctx, output1, blobTypeGoPackageArchive, blobClassifierVersion); err != nil {
 		t.Fatal(err)
 	}
@@ -4759,41 +4795,29 @@ func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Re-putting the action with a different output must drop stale classifications.
-	changed := base
-	changed.OutputID = output2
-	if err := st.q.upsertEntry(ctx, changed); err != nil {
-		t.Fatal(err)
+	// Re-putting the same output must not discard what classifying it cost: the
+	// output ID is the content, so the answer is still the same answer.
+	put(hexOf(bytes.Repeat([]byte{9}, 32)), output1)
+	blobType, retainedType := kindOf(output1)
+	if !blobType.Valid || blobTypeKind(blobType.Int64) != blobTypeGoPackageArchive {
+		t.Fatalf("blob_type = %v after re-put, want %d", blobType, blobTypeGoPackageArchive)
 	}
-	var blobType, retainedType sql.NullInt64
-	if err := st.db.QueryRowContext(ctx, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, idKey(actionID)).Scan(&blobType, &retainedType); err != nil {
-		t.Fatal(err)
-	}
-	if blobType.Valid {
-		t.Fatalf("blob_type = %d after output change, want NULL", blobType.Int64)
-	}
-	if retainedType.Valid {
-		t.Fatalf("retained_type = %d after output change, want NULL", retainedType.Int64)
+	if !retainedType.Valid || retainedTypeKind(retainedType.Int64) != retainedTypeExportArchive {
+		t.Fatalf("retained_type = %v after re-put, want %d", retainedType, retainedTypeExportArchive)
 	}
 
-	// Re-putting with the same output preserves cached classifications.
-	if err := st.q.updateBlobType(ctx, output2, blobTypeGoSource, blobClassifierVersion); err != nil {
-		t.Fatal(err)
+	// Repointing the action at a different output cannot carry the old
+	// classification across, because the classification belongs to the output.
+	put(action, output2)
+	blobType, retainedType = kindOf(output2)
+	if blobType.Valid {
+		t.Fatalf("blob_type = %d for an unclassified output, want NULL", blobType.Int64)
 	}
-	if err := st.q.updateRetainedType(ctx, output2, retainedTypeGeneratedCgoSource); err != nil {
-		t.Fatal(err)
+	if retainedType.Valid {
+		t.Fatalf("retained_type = %d for an unclassified output, want NULL", retainedType.Int64)
 	}
-	if err := st.q.upsertEntry(ctx, changed); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.db.QueryRowContext(ctx, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, idKey(actionID)).Scan(&blobType, &retainedType); err != nil {
-		t.Fatal(err)
-	}
-	if !blobType.Valid || blobTypeKind(blobType.Int64) != blobTypeGoSource {
-		t.Fatalf("blob_type = %v after same-output re-put, want %d", blobType, blobTypeGoSource)
-	}
-	if !retainedType.Valid || retainedTypeKind(retainedType.Int64) != retainedTypeGeneratedCgoSource {
-		t.Fatalf("retained_type = %v after same-output re-put, want %d", retainedType, retainedTypeGeneratedCgoSource)
+	if blobType, _ := kindOf(output1); !blobType.Valid {
+		t.Fatal("moving an action away from an output cleared that output's classification")
 	}
 }
 
@@ -4839,30 +4863,6 @@ func TestCatalogSchemaRejectsHexKeys(t *testing.T) {
 	if ent.OutputID != outputHex {
 		t.Fatalf("output ID = %q, want %q", ent.OutputID, outputHex)
 	}
-}
-
-func TestCatalogSchemaCoversStatusClassifications(t *testing.T) {
-	t.Parallel()
-
-	st, err := newStore(config{dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.close()
-
-	ctx := context.Background()
-	if has, err := indexExists(ctx, st.db, "entries_output_cover"); err != nil {
-		t.Fatal(err)
-	} else if !has {
-		t.Fatal("entries_output_cover missing from a fresh catalog")
-	}
-}
-
-func indexExists(ctx context.Context, db *sql.DB, name string) (bool, error) {
-	var count int
-	err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, name).Scan(&count)
-	return count > 0, err
 }
 
 func assertBlobKind(t *testing.T, statuses []blobTypeStatus, kind blobTypeKind, count int64) {
@@ -5284,6 +5284,18 @@ func TestCorruptBlobIsCacheMiss(t *testing.T) {
 	}
 	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
 		t.Fatalf("blob stat err = %v, want not exist", err)
+	}
+	// The inventory row has to go with it. Left behind it would keep counting the
+	// blob's compressed bytes toward maxSize, and eviction would work to a total
+	// that no longer exists.
+	var inventoried int
+	if err := st.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM outputs WHERE output_id = ?`,
+		idKey(hexOf(outputID))).Scan(&inventoried); err != nil {
+		t.Fatal(err)
+	}
+	if inventoried != 0 {
+		t.Error("a corrupt blob is still inventoried")
 	}
 }
 
@@ -5997,4 +6009,68 @@ func strconvQuote(s string) string {
 // tests do not carry a version number that a schema change has to chase.
 func testVersionDir(cacheDir string) string {
 	return cacheVersionDir(config{dir: cacheDir})
+}
+
+// An action re-put onto a different output leaves the old output inventoried with
+// nothing naming it — cmd/go does this whenever a build's result changes. Nothing
+// indexes output back to action, so the put cannot notice, and every entry in the
+// catalog can be fresh while that row is months old. Deciding whether an age pass
+// is worth the lock therefore has to look at both tables, or this garbage is only
+// ever reclaimed by size pressure.
+func TestPruneReclaimsAnOutputNoEntryNamesAnyMore(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	actionID := bytes.Repeat([]byte{71}, 32)
+	abandoned := bytes.Repeat([]byte{72}, 32)
+	replacement := bytes.Repeat([]byte{73}, 32)
+	body := []byte("rebuilt output")
+	for _, outputID := range [][]byte{abandoned, replacement} {
+		if _, err := st.put(request{
+			ID: 1, Command: cmdPut, ActionID: actionID, OutputID: outputID,
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Only the abandoned output is stale; the entry, now naming the replacement,
+	// was written just above and is fresh.
+	stale := unixMillis(trimCutoff(defaultMaxAge, time.Now())) - int64(time.Minute/time.Millisecond)
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`,
+		stale, idKey(hexOf(abandoned))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(context.Background(),
+		`DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	var inventoried int
+	if err := st.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM outputs WHERE output_id = ?`,
+		idKey(hexOf(abandoned))).Scan(&inventoried); err != nil {
+		t.Fatal(err)
+	}
+	if inventoried != 0 {
+		t.Error("an output no entry names was left in the inventory")
+	}
+	if _, err := os.Stat(st.blobPath(hexOf(abandoned))); !os.IsNotExist(err) {
+		t.Errorf("abandoned blob stat err = %v, want not exist", err)
+	}
+	if _, err := st.lookupEntry(hexOf(actionID)); err != nil {
+		t.Fatalf("the surviving entry was pruned: %v", err)
+	}
+	if _, err := os.Stat(st.blobPath(hexOf(replacement))); err != nil {
+		t.Errorf("replacement blob was pruned: %v", err)
+	}
 }
