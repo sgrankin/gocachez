@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -611,6 +612,13 @@ func liveOutputID(path string) string {
 	base := filepath.Base(path)
 	outputID, _, ok := strings.Cut(base, "-")
 	if !ok {
+		return ""
+	}
+	// The run directory is handed to the go command, and anything may end up in it.
+	// This ID reaches the catalog, where a name that is not a hex digest is a broken
+	// invariant and panics rather than being ignored — so a name we did not write has
+	// to stop being treated as an output ID here, at the boundary.
+	if _, err := hex.DecodeString(outputID); err != nil {
 		return ""
 	}
 	return outputID

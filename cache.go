@@ -293,6 +293,14 @@ func (st *store) flushAccessTimes() error {
 		return nil
 	}
 
+	if err := st.writeAccessTimes(accessed, accessedOutputs); err != nil {
+		st.restoreAccessed(accessed, accessedOutputs)
+		return err
+	}
+	return nil
+}
+
+func (st *store) writeAccessTimes(accessed, accessedOutputs map[string]int64) error {
 	ctx := context.Background()
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -306,6 +314,27 @@ func (st *store) flushAccessTimes() error {
 		return fmt.Errorf("commit access-time transaction: %w", err)
 	}
 	return nil
+}
+
+// restoreAccessed puts a failed batch back so the next flush carries it.
+//
+// The batch is taken out of the maps before the transaction starts, so without this
+// a flush that loses the writer race discards those hits for good — and eviction
+// ranks on exactly this column, which makes the entries most in use look like the
+// coldest in the cache. A later access always wins, since it is the newer fact.
+func (st *store) restoreAccessed(entries, outputs map[string]int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for id, at := range entries {
+		if st.accessed[id] < at {
+			st.accessed[id] = at
+		}
+	}
+	for id, at := range outputs {
+		if st.accessedOutputs[id] < at {
+			st.accessedOutputs[id] = at
+		}
+	}
 }
 
 func (st *store) materialize(ent entry) (string, error) {

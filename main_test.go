@@ -6607,3 +6607,70 @@ func TestOrphanCollectionIgnoresAPendingPut(t *testing.T) {
 		t.Fatalf("abandoned pending file stat err = %v, want not exist", err)
 	}
 }
+
+// The run directory is handed to the go command, so a name gocachez did not write can
+// turn up in it. That name reaches the catalog, where a non-hex ID is treated as a
+// broken invariant and panics, so it has to stop being an output ID at the boundary.
+func TestClosingIgnoresALiveFileWithoutAnOutputID(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A package archive under a name whose prefix is not a digest. Recognisable
+	// content is the point: it reaches the retained-file path and would have been
+	// filed under an output ID of "zz".
+	body := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 64))
+	if err := os.WriteFile(filepath.Join(st.runDir, "zz-artifact"), body, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	// close panicked here rather than returning: idKey treats a non-hex ID as a
+	// broken invariant, which it is — just not for a name from the filesystem.
+	st.close()
+}
+
+// A flush that loses the writer race must not discard the hits it was carrying. They
+// are taken out of the pending maps before the transaction begins, and eviction ranks
+// on exactly this column, so losing them makes the entries most in use look like the
+// coldest in the cache.
+func TestFailedAccessFlushKeepsItsHits(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionID := bytes.Repeat([]byte{71}, 32)
+	outputID := bytes.Repeat([]byte{72}, 32)
+	body := []byte("flush me")
+	if _, err := st.put(request{
+		ID: 1, Command: cmdPut, ActionID: actionID, OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionID}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Closing the catalog underneath the flush is the reachable stand-in for losing
+	// the write race: either way the transaction never commits.
+	if err := st.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.flushAccessTimes(); err == nil {
+		t.Fatal("flush succeeded against a closed catalog")
+	}
+
+	st.mu.Lock()
+	entries, outputs := len(st.accessed), len(st.accessedOutputs)
+	st.mu.Unlock()
+	if entries == 0 {
+		t.Error("a failed flush discarded the entry hits it was carrying")
+	}
+	if outputs == 0 {
+		t.Error("a failed flush discarded the output hits it was carrying")
+	}
+}
