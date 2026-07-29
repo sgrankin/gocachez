@@ -6944,10 +6944,24 @@ func TestOneUnreadableLiveFileDoesNotDiscardTheRetainedRun(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(blocked, 0o600) })
 
+	// Backdated so the refresh below is visible. An unstamped retained run directory
+	// older than the cutoff is exactly what sweepLiveRuns takes.
+	stale := time.Now().Add(-90 * 24 * time.Hour)
+	if err := os.Chtimes(st.runLock.Path(), stale, stale); err != nil {
+		t.Fatal(err)
+	}
 	st.close()
 
 	if _, err := os.Stat(res.DiskPath); err != nil {
 		t.Errorf("the run's retained live path was discarded: %v", err)
+	}
+	// Kept because something failed is still kept, so the timestamp has to say so.
+	info, err := os.Stat(st.runLock.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ModTime().Equal(stale) {
+		t.Error("the retained run directory was not stamped, so the next sweep reclaims it")
 	}
 }
 
@@ -7247,5 +7261,86 @@ func TestLiveOutputIDRejectsAnUppercaseName(t *testing.T) {
 	}
 	if got := liveOutputID("/live/AB/" + strings.Repeat("AB", 32) + "-pkg.a"); got != "" {
 		t.Errorf("liveOutputID(uppercase) = %q, want it refused", got)
+	}
+}
+
+// Retained-file expiry runs ahead of the gated scan and leaves itself due when it does
+// not complete. So returning its error would make a retained tree it cannot delete from
+// fail in the same place on every close, and size enforcement would never be reached.
+func TestARetainedFileThatCannotBeDeletedDoesNotStopSizeEviction(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir, maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedOutput := bytes.Repeat([]byte{0x7a}, 32)
+	body := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 64))
+	if _, err := st.put(request{
+		ID: 1, Command: cmdPut, ActionID: bytes.Repeat([]byte{0x7b}, 32),
+		OutputID: retainedOutput, BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	// Expired, and in a directory that can be read and stat'd but not written — so the
+	// walk and the orphan scan both succeed and only the removal fails.
+	exportPath := retainedPath(cacheDir, retainedOutput, ".a")
+	old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
+	if err := os.Chtimes(exportPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	shardDir := filepath.Dir(exportPath)
+	if err := os.Chmod(shardDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(shardDir, 0o700) })
+
+	st, err = newStore(config{dir: cacheDir, maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	if _, err := st.db.ExecContext(context.Background(),
+		`DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	// One colder blob in a different shard, and a budget short by a single byte, so the
+	// pass evicts exactly that one and never reaches the retained output above — whose
+	// own retained file lives in the directory that cannot be written to.
+	cold := bytes.Repeat([]byte{0x4d}, 32)
+	coldBody := incompressibleBody(t, 8<<10, 3)
+	if _, err := st.put(request{
+		ID: 2, Command: cmdPut, ActionID: bytes.Repeat([]byte{0x4e}, 32),
+		OutputID: cold, BodySize: int64(len(coldBody)),
+	}, bufio.NewReader(encodedBody(coldBody))); err != nil {
+		t.Fatal(err)
+	}
+	blobPath := st.blobPath(hexOf(cold))
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`,
+		unixMillis(time.Now().Add(-time.Hour)), idKey(hexOf(cold))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`,
+		unixMillis(time.Now()), idKey(hexOf(retainedOutput))); err != nil {
+		t.Fatal(err)
+	}
+	total, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.maxSize = total - 1
+	st.installed.Store(0)
+
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Errorf("over-budget blob stat err = %v, want not exist", err)
 	}
 }

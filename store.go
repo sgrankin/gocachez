@@ -144,6 +144,8 @@ type store struct {
 	runDir            string
 	runLock           *flock.Flock
 	mu                sync.Mutex
+	stripeDirOnce     sync.Once
+	stripeDirErr      error
 	encoderPool       sync.Pool
 	decoderPool       sync.Pool
 	liveWriterPool    sync.Pool
@@ -165,11 +167,6 @@ func newStore(cfg config) (*store, error) {
 	versionDir, blobsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
 	if err := os.MkdirAll(versionDir, 0o777); err != nil {
 		return nil, fmt.Errorf("create version dir: %w", err)
-	}
-	// Locks are taken here by builds and by maintenance alike, so the directory has
-	// to exist before either starts rather than being created under one of them.
-	if err := os.MkdirAll(stripesDir(versionDir), 0o777); err != nil {
-		return nil, fmt.Errorf("create stripe dir: %w", err)
 	}
 
 	var st *store
@@ -558,7 +555,10 @@ func (st *store) unregisterRun() error {
 	if deleteErr := st.q.deleteRun(context.Background(), st.runID); deleteErr != nil {
 		err = errors.Join(err, fmt.Errorf("delete run record: %w", deleteErr))
 	}
-	if retainedLiveFiles && prepareErr == nil {
+	// Stamped whenever the directory is kept, including when it is kept because
+	// something failed. An unstamped retained directory older than the cutoff is
+	// exactly what sweepLiveRuns removes.
+	if retainedLiveFiles {
 		now := time.Now()
 		if touchErr := os.Chtimes(st.runLock.Path(), now, now); touchErr != nil {
 			err = errors.Join(err, fmt.Errorf("timestamp retained live run: %w", touchErr))
@@ -588,30 +588,35 @@ func (st *store) unregisterRun() error {
 func (st *store) prepareLiveRunForClose() (bool, error) {
 	retained := false
 	var failures error
-	err := filepath.WalkDir(st.runDir, func(path string, d os.DirEntry, err error) error {
+	// failed records a problem with one path and keeps the run directory. Nothing here
+	// may abandon the walk: the paths already retained have escaped to the build, the
+	// directory is removed when nothing was retained, and a path this pass could not
+	// resolve is one it cannot prove is safe to take away.
+	failed := func(err error) {
+		failures = errors.Join(failures, err)
+		retained = true
+	}
+	if walkErr := filepath.WalkDir(st.runDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
 			}
-			return fmt.Errorf("read live run dir: %w", err)
+			failed(fmt.Errorf("read live run dir: %w", err))
+			return nil
 		}
 		if d.IsDir() || d.Name() == runLockName {
 			return nil
 		}
 		if !d.Type().IsRegular() {
 			if err := os.RemoveAll(path); err != nil {
-				return fmt.Errorf("remove live path: %w", err)
+				failed(fmt.Errorf("remove live path: %w", err))
+				return nil
 			}
 			return nil
 		}
 		stripped, err := st.stripLivePackageArchiveToExport(path)
 		if err != nil {
-			// Carry on rather than abandoning the walk, and keep the directory. The
-			// file is untouched, so its path may still be in use, and the paths of
-			// everything already retained have escaped to the build — a single
-			// unreadable file is no reason to take all of them away.
-			failures = errors.Join(failures, err)
-			retained = true
+			failed(err)
 			return nil
 		}
 		if stripped {
@@ -619,12 +624,12 @@ func (st *store) prepareLiveRunForClose() (bool, error) {
 			return nil
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove live file: %w", err)
+			failed(fmt.Errorf("remove live file: %w", err))
+			return nil
 		}
 		return nil
-	})
-	if err != nil {
-		return retained, errors.Join(failures, err)
+	}); walkErr != nil {
+		failures = errors.Join(failures, walkErr)
 	}
 	return retained, errors.Join(failures, removeEmptyDirs(st.runDir))
 }

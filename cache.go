@@ -177,9 +177,9 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	}
 
 	var compressedSize int64
-	// The stripe covers the file operations and nothing else. Deliberately not the
-	// catalog write that follows: a lock held across a transaction that can wait out a
-	// five-second busy timeout would stall every build wanting this shard, and the
+	// The stripe covers the file operations and nothing else — deliberately not the
+	// catalog write that follows, because a lock held across a transaction that can wait
+	// out a five-second busy timeout would stall every build wanting this shard, and the
 	// window it would close costs a cache miss rather than correctness.
 	if err := st.withOutputLock(outputHex, func() error {
 		var err error
@@ -494,7 +494,7 @@ func (st *store) createLiveFile(outputHex string) (string, error) {
 }
 
 // installBlobLocked puts a put's compressed output in place. The caller holds the
-// output's stripe across this and the catalog write that follows it.
+// output's stripe across it; the catalog write recording the result is outside.
 func installBlobLocked(tmpPath, dst string) (int64, error) {
 	if regularFile(dst) {
 		size, err := adoptBlob(dst)
@@ -541,8 +541,17 @@ func (st *store) lookupEntry(actionID string) (entry, error) {
 }
 
 func (st *store) dropAction(actionID, outputID string) error {
-	if err := os.Remove(st.blobPath(outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove bad blob: %w", err)
+	// Under the stripe, like every other unlink of a blob. Without it a get that found
+	// its blob missing could unlink the file a put had installed in the meantime,
+	// between that put's rename and the size it reads back — and a put that fails is a
+	// build error, not a miss.
+	if err := st.withOutputLock(outputID, func() error {
+		if err := os.Remove(st.blobPath(outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove bad blob: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if err := st.q.dropAction(context.Background(), actionID, outputID); err != nil {
 		return fmt.Errorf("drop bad output: %w", err)
@@ -567,12 +576,9 @@ func (st *store) dropAction(actionID, outputID string) error {
 // analysis ran unlocked, applyPrune re-verifies what it is about to delete; see
 // prunePlan.
 //
-// That invariant has one gap, and it predates the split: unregisterRun deletes
-// its row before writing retained files and stamping run.lock, so a closing
-// store can still touch the cache while counting as idle. It holds its own
-// run.lock throughout, and entries for anything it retains are freshly
-// accessed, so the reachable outcome is a lost retained file rather than a lost
-// blob or a dangling row.
+// That gap is closed: unregisterRun keeps its row until its retained files are adopted
+// and run.lock is stamped, so a closing store never counts as idle while it is still
+// touching the cache.
 // pruneCache runs maintenance now rather than when the interval next allows it.
 //
 // Maintenance otherwise happens as a helper exits, and the go command waits for
@@ -663,8 +669,12 @@ func (st *store) prune() error {
 		// last attempt is retried now rather than at the next interval. Costs two lock
 		// attempts and a count when it cannot proceed.
 		if retainedDue {
+			// Logged rather than returned: its stamp is only written on success, so
+			// returning would make a persistently unreadable retained tree retry and
+			// fail ahead of the gated scan on every close, and size enforcement would
+			// never be reached at all.
 			if err := st.expireRetainedWhenIdle(now); err != nil {
-				return err
+				log.Printf("gocachez: retained-file expiry failed: %v", err)
 			}
 		}
 		if !pruneDue {
@@ -846,10 +856,9 @@ func (st *store) planPrune(now time.Time) (prunePlan, error) {
 	return plan, nil
 }
 
-// applyPrune performs the plan's deletions under the lifecycle lock, or does
-// nothing if the cache turned out to be in use or another process got there
-// first. The stamp is only written when a scan actually completed, so a declined
-// attempt is retried by the next process to exit past the interval.
+// applyPrune performs the plan's deletions, or nothing if another process stamped while
+// this one was planning. It takes no lifecycle lock: what it deletes are blobs, and each
+// goes under its output's stripe.
 func (st *store) applyPrune(plan prunePlan) error {
 	// Another process may have finished a scan while this one was planning. Checked
 	// before any lock is taken, so a pass with nothing to do touches nothing.
@@ -880,25 +889,30 @@ func (st *store) applyPrune(plan prunePlan) error {
 // registered until its retained files are adopted, no build is part way through claiming
 // one when this finds the count at zero.
 //
-// The walk happens after the idle check, not before, so an attempt that cannot proceed
-// costs two lock attempts and a count. Reclaiming the directories of runs that are gone
-// rides along, because it needs the same lock: a starting store takes it too.
+// The cache is probed for idleness before the tree is walked and again after, under the
+// lock, because neither ordering is sufficient alone. Walking first and holding the lock
+// across it stalls every starting build for the length of the walk — newStore takes the
+// same lock. Walking only under the lock avoids that but does the walk on every close of
+// a busy cache, since a skipped attempt deliberately leaves itself due. So: probe, walk
+// unlocked, then confirm. A file used between the walk and the removal is kept by the
+// mtime re-check in removeExpiredRetainedFiles, which is why the unlocked walk is safe.
 func (st *store) expireRetainedWhenIdle(now time.Time) error {
+	idle, err := st.cacheIdle()
+	if err != nil || !idle {
+		// Not stamped, so the next close tries again.
+		return err
+	}
+	expired, err := st.planOldRetainedFiles(now)
+	if err != nil {
+		return err
+	}
 	applied, err := withFileLockIfFree(st.lifecycleLockPath, func() error {
-		if err := st.cleanupAbandonedRuns(); err != nil {
-			log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
-		}
 		active, err := st.q.countRuns(context.Background())
 		if err != nil {
 			return fmt.Errorf("count active runs: %w", err)
 		}
 		if active > 0 {
-			// Deliberately not stamped, so the next close tries again.
 			return nil
-		}
-		expired, err := st.planOldRetainedFiles(now)
-		if err != nil {
-			return err
 		}
 		if err := st.removeExpiredRetainedFiles(expired, trimCutoff(st.retainedAge(), now)); err != nil {
 			return err
@@ -912,6 +926,30 @@ func (st *store) expireRetainedWhenIdle(now time.Time) error {
 		log.Print("gocachez: skipped retained-file expiry, another process holds the cache lock")
 	}
 	return err
+}
+
+// cacheIdle reports whether no build is registered. Reclaiming the directories of runs
+// that are gone rides along, because it needs the same lock a starting store takes; that
+// costs a query and one lock attempt per registered run, so it is bounded by how many
+// builds the host runs at once rather than by the size of the cache.
+func (st *store) cacheIdle() (bool, error) {
+	idle := false
+	applied, err := withFileLockIfFree(st.lifecycleLockPath, func() error {
+		if err := st.cleanupAbandonedRuns(); err != nil {
+			log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
+		}
+		active, err := st.q.countRuns(context.Background())
+		if err != nil {
+			return fmt.Errorf("count active runs: %w", err)
+		}
+		idle = active == 0
+		return nil
+	})
+	// Another process holding the lock is another process doing this work.
+	if err == nil && !applied && st.verbose {
+		log.Print("gocachez: skipped retained-file expiry, another process holds the cache lock")
+	}
+	return applied && idle, err
 }
 
 // planToMaxSize lists blobs to evict, least recently used first, or nothing if
@@ -941,6 +979,11 @@ func (st *store) planToMaxSize(entryCutoff int64) ([]pruneCandidate, error) {
 	// and takes everything from there.
 	cursor := evictionCursor{accessedAt: entryCutoff, size: -1, id: -1}
 	need := total - st.maxSize
+	// Pages are separate reads, so an output whose access time is refreshed between two
+	// of them can move past the cursor and appear again. Counting it twice against the
+	// overshoot would stop the pass short of the budget, since eviction can only free it
+	// once.
+	seen := make(map[string]struct{})
 	var candidates []pruneCandidate
 	for need > 0 {
 		batch, err := st.q.evictionCandidates(ctx, cursor, evictionSampleSize)
@@ -951,6 +994,10 @@ func (st *store) planToMaxSize(entryCutoff int64) ([]pruneCandidate, error) {
 			break
 		}
 		for _, candidate := range batch {
+			if _, dup := seen[candidate.outputID]; dup {
+				continue
+			}
+			seen[candidate.outputID] = struct{}{}
 			candidates = append(candidates, candidate)
 			need -= candidate.size
 			if need <= 0 {
@@ -1109,6 +1156,17 @@ func (st *store) removeStalePendingBlobs(now time.Time) error {
 // ordering to get wrong. Maintenance takes the maintenance lock outside these; a build
 // takes only these.
 func (st *store) withOutputLock(outputHex string, fn func() error) error {
+	// Created on demand rather than at startup: prune and clean build a store by hand,
+	// and a cache tree restored without this directory would otherwise open cleanly and
+	// fail the first time maintenance wanted a lock.
+	st.stripeDirOnce.Do(func() {
+		if err := os.MkdirAll(stripesDir(st.versionDir), 0o777); err != nil {
+			st.stripeDirErr = fmt.Errorf("create stripe dir: %w", err)
+		}
+	})
+	if st.stripeDirErr != nil {
+		return st.stripeDirErr
+	}
 	return withFileLock(filepath.Join(stripesDir(st.versionDir), outputShard(outputHex)+".lock"), fn)
 }
 

@@ -37,12 +37,16 @@ type cacheStatus struct {
 	retainedTypes    []retainedTypeStatus
 	activeLiveRuns   int64
 	inactiveLiveRuns int64
-	// lastScan and lastSweep are how long ago each maintenance pass completed,
-	// and whether it ever has. The scan declines while any build is registered
-	// and stamps nothing when it does, so on a busy host an absent scan stamp is
-	// the difference between limits being enforced and being ignored.
+	// lastScan, lastSweep and lastRetained are how long ago each maintenance pass
+	// completed, and whether it ever has. Only retained-file expiry needs the cache
+	// idle, so on a busy host it is the one whose stamp can stay absent while the
+	// others advance.
 	lastScan  stamp
 	lastSweep stamp
+	// lastRetained is the one worth watching on a busy host: it is the only pass that
+	// still needs the cache idle, so it is the only stamp that can stay absent while the
+	// others advance.
+	lastRetained stamp
 }
 
 type stamp struct {
@@ -81,10 +85,9 @@ type retainedTypeStatus struct {
 	size  int64
 }
 
-// formatStamp says how long ago a pass completed. "never" is not cosmetic: the scan
-// enforces maxSize and maxAge, declines while any build is registered, and stamps
-// nothing when it declines, so never having completed means neither limit is being
-// applied.
+// formatStamp says how long ago a pass completed. "never" is not cosmetic: a pass that
+// has never completed is a limit that has never been applied, and retained-file expiry
+// stamps nothing on the attempts it declines for want of an idle cache.
 func formatStamp(st stamp) string {
 	if !st.found {
 		return "never"
@@ -120,6 +123,7 @@ func writeStatus(cfg config, w io.Writer) error {
 		{"Live runs", formatLiveRuns(status.activeLiveRuns, status.inactiveLiveRuns)},
 		{"Last scan", formatStamp(status.lastScan)},
 		{"Last sweep", formatStamp(status.lastSweep)},
+		{"Last retained trim", formatStamp(status.lastRetained)},
 	}); err != nil {
 		return err
 	}
@@ -195,6 +199,7 @@ func readStatus(cfg config) (cacheStatus, error) {
 	}
 	status.lastScan = stampAge(pruneStampPath(versionDir))
 	status.lastSweep = stampAge(sweepStampPath(versionDir))
+	status.lastRetained = stampAge(retainedStampPath(versionDir))
 	status.activeLiveRuns, status.inactiveLiveRuns, err = readLiveStatus(liveRoot)
 	if err != nil {
 		return cacheStatus{}, err

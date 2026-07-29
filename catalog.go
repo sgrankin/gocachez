@@ -748,8 +748,14 @@ func commitClassifications[K ~int](ctx context.Context, db *sql.DB, stmt *sql.St
 // forever or step past it, and stepping past silently dropped every candidate it had not
 // returned. That is not rare: the access flush stamps a whole batch with one millisecond,
 // so thousands of outputs can share a timestamp, and skipping them leaves the cache over
-// budget with the pass reporting itself done. Ordering by the full index keeps the seek
-// and the limit index-driven, with no sort — see TestEvictionPagesThroughTiedAccessTimes.
+// budget with the pass reporting itself done.
+//
+// The three-part cursor is a total order, so no row can fall between two pages. It is not
+// a three-part seek: SQLite plans this as a range on (accessed_at, compressed_size) and
+// filters the rowid after, so a page beginning inside a group that shares both of those
+// re-reads that group's earlier rows. Naming id in the index explicitly does not change
+// the plan — measured — so the bound stands as it is, and it costs re-reads only where
+// more than a page of outputs share an access time and a compressed size to the byte.
 func (c *catalog) evictionCandidates(ctx context.Context, after evictionCursor, limit int) ([]pruneCandidate, error) {
 	rows, err := c.db.QueryContext(ctx, `
 SELECT output_id, compressed_size, accessed_at, id

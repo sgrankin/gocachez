@@ -413,16 +413,17 @@ $ gocachez prune -config /path/to/gocachez.json
 ```
 
 Best placed after the last `go` command in a job and before archiving, so the
-archive is of a cache already under its limits. It reports on stdout if builds
-are still registered, in which case it reclaims live run directories and leaves
-the blobs alone; add `-v` to log what it removed. It exits 0 either way, so it
+archive is of a cache already under its limits. It reports on stdout if builds are still
+registered, in which case it still expires by age and evicts to `maxSize` and only
+retained `go list` files are left for later; add `-v` to log what it removed. It exits 0 either way, so it
 will not fail a job for being unable to do the full pass.
 
 ### Concurrency
 
 Several `go` commands can share one cache directory. Each `gocachez` process
-registers a run, and blobs and catalog entries are only ever deleted while none
-are registered, so parallel jobs neither corrupt the cache nor block each other
+registers a run. Deleting a blob takes a lock on its shard, which installing and opening
+one take too, and a blob is named by the digest of its contents — so parallel jobs neither
+corrupt the cache nor block each other
 — the expensive part of a maintenance scan runs without the lock that a starting
 process needs. Live run directories are held by a lock of their own instead, so
 reclaiming them does not wait for the cache to fall idle, which on a busy
