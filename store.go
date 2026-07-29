@@ -85,9 +85,13 @@ CREATE TABLE IF NOT EXISTS runs (
 `
 
 type entry struct {
-	ActionID       string
-	OutputID       string
-	Size           int64
+	ActionID string
+	OutputID string
+	Size     int64
+	// CompressedSize and AccessedAt are inputs to a put, recorded against the
+	// output rather than the action. A lookup does not read them back — a cache hit
+	// has no use for either, and fetching them would mean joining outputs — so they
+	// are zero on anything lookupEntry returns.
 	CompressedSize int64
 	CreatedAt      time.Time
 	AccessedAt     time.Time
