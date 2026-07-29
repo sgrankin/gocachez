@@ -212,6 +212,16 @@ func (st *store) get(req request) (response, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return response{ID: req.ID, Miss: true}, nil
 	}
+	if errors.Is(err, errOutputTagMismatch) {
+		// Logged unconditionally rather than under verbose: reaching here means an
+		// output id was handed to different content, which nothing in normal
+		// operation can do, and a guard that fires unseen is barely a guard.
+		log.Printf("gocachez: %v; treating as a miss and forgetting the entry", err)
+		if deleteErr := st.q.deleteAction(context.Background(), actionHex); deleteErr != nil {
+			log.Printf("gocachez: forgetting the mismatched entry failed: %v", deleteErr)
+		}
+		return response{ID: req.ID, Miss: true}, nil
+	}
 	if err != nil {
 		return response{}, err
 	}

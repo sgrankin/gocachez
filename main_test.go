@@ -3168,8 +3168,9 @@ func TestEvictionStepStaysBounded(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO entries(action_id, output, created_at, accessed_at) VALUES (?, ?, ?, ?)`,
-			action[:], outputRef, now, accessedAt,
+			`INSERT INTO entries(action_id, output, output_tag, created_at, accessed_at)
+			 VALUES (?, ?, ?, ?, ?)`,
+			action[:], outputRef, output[:outputTagLen], now, accessedAt,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -4908,7 +4909,8 @@ func TestCatalogSchemaRejectsHexKeys(t *testing.T) {
 		},
 		{
 			"an action ID as hex text",
-			`INSERT INTO entries(action_id, output, created_at, accessed_at) VALUES (?, 1, 0, 0)`,
+			`INSERT INTO entries(action_id, output, output_tag, created_at, accessed_at)
+			 VALUES (?, 1, x'00000000', 0, 0)`,
 			[]any{actionHex},
 		},
 	} {
@@ -6706,7 +6708,8 @@ func TestAgeExpiryRemovesEveryStaleRowAcrossBatches(t *testing.T) {
 			at, wantFresh = fresh, wantFresh+1
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO entries(action_id, output, created_at, accessed_at) VALUES (?, 1, ?, ?)`,
+			`INSERT INTO entries(action_id, output, output_tag, created_at, accessed_at)
+			 VALUES (?, 1, x'00000000', ?, ?)`,
 			action[:], fresh, at,
 		); err != nil {
 			t.Fatal(err)
@@ -6730,5 +6733,81 @@ func TestAgeExpiryRemovesEveryStaleRowAcrossBatches(t *testing.T) {
 	}
 	if surviving != wantFresh {
 		t.Errorf("%d entries survived, want %d — a batch was skipped or the cursor stalled", surviving, wantFresh)
+	}
+}
+
+// AUTOINCREMENT stops output ids being reused only while sqlite_sequence is intact.
+// Reset it — or restore it separately from the rest of the database — and an id is
+// handed out again, so a stale entry resolves to content it never named. That is the
+// one failure this cache must not have: not a miss, but a wrong build artifact, with
+// nothing to notice it. The tag each entry carries is what notices.
+func TestReusedOutputIDIsCaughtRatherThanServed(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	ctx := context.Background()
+	staleAction := bytes.Repeat([]byte{101}, 32)
+	firstOutput := bytes.Repeat([]byte{102}, 32)
+	firstBody := []byte("the artifact this action produced")
+	if _, err := st.put(request{
+		ID: 1, Command: cmdPut, ActionID: staleAction, OutputID: firstOutput,
+		BodySize: int64(len(firstBody)),
+	}, bufio.NewReader(encodedBody(firstBody))); err != nil {
+		t.Fatal(err)
+	}
+	var reusedID int64
+	if err := st.db.QueryRowContext(ctx, `SELECT output FROM entries WHERE action_id = ?`,
+		idKey(hexOf(staleAction))).Scan(&reusedID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force the id back into circulation, which is what a tampered or independently
+	// restored sequence does.
+	if _, err := st.db.ExecContext(ctx, `DELETE FROM outputs WHERE id = ?`, reusedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx,
+		`UPDATE sqlite_sequence SET seq = ? WHERE name = 'outputs'`, reusedID-1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unrelated content takes the freed id.
+	otherOutput := bytes.Repeat([]byte{103}, 32)
+	otherBody := []byte("something else entirely")
+	if _, err := st.put(request{
+		ID: 2, Command: cmdPut, ActionID: bytes.Repeat([]byte{104}, 32), OutputID: otherOutput,
+		BodySize: int64(len(otherBody)),
+	}, bufio.NewReader(encodedBody(otherBody))); err != nil {
+		t.Fatal(err)
+	}
+	var tookIt int64
+	if err := st.db.QueryRowContext(ctx, `SELECT id FROM outputs WHERE output_id = ?`,
+		idKey(hexOf(otherOutput))).Scan(&tookIt); err != nil {
+		t.Fatal(err)
+	}
+	if tookIt != reusedID {
+		t.Fatalf("the unrelated output took id %d, not the freed %d — the reuse was not reproduced",
+			tookIt, reusedID)
+	}
+
+	// The stale action now points at the other output. It must not be served.
+	res, err := st.get(request{ID: 3, Command: cmdGet, ActionID: staleAction})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Miss {
+		t.Fatalf("served output %x for an action that produced %x", res.OutputID, firstOutput)
+	}
+	if _, err := st.lookupEntry(hexOf(staleAction)); !errorsIs(err, sql.ErrNoRows) {
+		t.Errorf("the mismatched entry was not forgotten: %v", err)
+	}
+	// And the output it wrongly resolved to is somebody else's, so it stays.
+	if _, err := os.Stat(st.blobPath(hexOf(otherOutput))); err != nil {
+		t.Errorf("took the innocent output's blob: %v", err)
 	}
 }

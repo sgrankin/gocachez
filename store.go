@@ -54,6 +54,14 @@ const cacheSchemaVersion = 2
 // frees its id for the next put — and an entry still naming that id would then
 // resolve to different content, which is a wrong build artifact rather than a miss.
 //
+// output_tag is what makes that guarantee checkable rather than merely argued.
+// AUTOINCREMENT holds only while sqlite_sequence does: reset it, or restore it
+// separately from the rest of the database, and ids are handed out again. So every
+// entry also records the leading bytes of the digest it meant, and a lookup that
+// disagrees with the output it resolved to is reported and treated as a miss. It
+// costs four bytes an entry to turn the worst failure this cache has — a silently
+// wrong artifact — into the one it handles a hundred times a day.
+//
 // entries has no index on accessed_at. It cost 51 bytes an entry, a third of the
 // catalog, to find rows that hold no disk — blob liveness is an outputs row — and
 // it made the age reaper 2.8x slower, because every deleted row had to have its
@@ -94,6 +102,7 @@ CREATE INDEX IF NOT EXISTS outputs_accessed_at ON outputs(accessed_at, compresse
 CREATE TABLE IF NOT EXISTS entries (
 	action_id BLOB PRIMARY KEY,
 	output INTEGER NOT NULL,
+	output_tag BLOB NOT NULL,
 	created_at INTEGER NOT NULL,
 	accessed_at INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;

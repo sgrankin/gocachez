@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/hex"
@@ -21,6 +22,23 @@ type catalogDB interface {
 // held — from the protocol, or read back out of a BLOB column — so a decode
 // failure is a broken invariant in this program rather than bad input, and there
 // is no value it could return that would not corrupt the catalog.
+// outputTagLen is how much of an output digest an entry carries alongside the
+// interned id it references. Four bytes cannot identify an output — 268k of them
+// collide on 32 bits often enough — and it is not meant to. It is a witness that the
+// id still points where it did when the entry was written, which is exactly the thing
+// AUTOINCREMENT can only promise and not prove.
+const outputTagLen = 4
+
+// outputTag is the witness stored with an entry, and the value a resolved output must
+// reproduce. Short IDs are taken whole; cmd/go's are 32 bytes.
+func outputTag(outputKey []byte) []byte {
+	return outputKey[:min(outputTagLen, len(outputKey))]
+}
+
+// errOutputTagMismatch means an entry resolved to an output it did not name: its
+// interned id has been handed to different content. Callers treat it as a miss.
+var errOutputTagMismatch = errors.New("entry resolved to the wrong output")
+
 func idKey(hexID string) []byte {
 	key, err := hex.DecodeString(hexID)
 	if err != nil {
@@ -38,16 +56,20 @@ func idKey(hexID string) []byte {
 //
 // The join resolves the interned output reference. An entry whose output has been
 // evicted matches nothing and reads as a miss, which is the soft reference working.
+//
+// output_tag comes back so the caller can check the resolved output is the one the
+// entry meant; see outputTagLen.
 const lookupEntrySQL = `
-SELECT o.output_id, o.size, e.created_at
+SELECT o.output_id, o.size, e.created_at, e.output_tag
 FROM entries e JOIN outputs o ON o.id = e.output
 WHERE e.action_id = ?`
 
 const upsertEntrySQL = `
-INSERT INTO entries(action_id, output, created_at, accessed_at)
-VALUES (?, ?, ?, ?)
+INSERT INTO entries(action_id, output, output_tag, created_at, accessed_at)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(action_id) DO UPDATE SET
 	output = excluded.output,
+	output_tag = excluded.output_tag,
 	created_at = excluded.created_at,
 	accessed_at = excluded.accessed_at`
 
@@ -204,7 +226,7 @@ func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
 		return fmt.Errorf("record output: %w", err)
 	}
 	if err := txExec(ctx, tx, c.upsertStmt, upsertEntrySQL,
-		action, outputRef, unixMillis(ent.CreatedAt), accessedAt); err != nil {
+		action, outputRef, outputTag(output), unixMillis(ent.CreatedAt), accessedAt); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("record entry: %w", err)
 	}
@@ -250,14 +272,25 @@ func (c *catalog) lookupEntry(ctx context.Context, actionID string) (entry, erro
 		row = c.db.QueryRowContext(ctx, lookupEntrySQL, key)
 	}
 	ent := entry{ActionID: actionID}
-	var outputID []byte
+	var outputID, tag []byte
 	var createdAt int64
-	if err := row.Scan(&outputID, &ent.Size, &createdAt); err != nil {
+	if err := row.Scan(&outputID, &ent.Size, &createdAt, &tag); err != nil {
 		return entry{}, err
+	}
+	if !bytes.Equal(tag, outputTag(outputID)) {
+		return entry{}, fmt.Errorf("%w: tag %x resolved to output %x", errOutputTagMismatch, tag, outputID)
 	}
 	ent.OutputID = hex.EncodeToString(outputID)
 	ent.CreatedAt = millisTime(createdAt)
 	return ent, nil
+}
+
+// deleteAction forgets one action and nothing else. The tag-mismatch path needs this
+// rather than dropAction: the output it wrongly resolved to is somebody else's, and
+// perfectly good.
+func (c *catalog) deleteAction(ctx context.Context, actionID string) error {
+	_, err := c.db.ExecContext(ctx, `DELETE FROM entries WHERE action_id = ?`, idKey(actionID))
+	return err
 }
 
 // touchAccessed updates the access times a run has accumulated, in one
