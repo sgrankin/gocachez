@@ -578,7 +578,7 @@ func readLiveStatus(liveRoot string) (int64, int64, error) {
 		// a read-only report — resurrect run dirs that a concurrent prune is
 		// midway through removing, making its own rmdir fail and leaving the
 		// run to show up as inactive until maxAge elapses.
-		runLock := flock.New(filepath.Join(runDir, "run.lock"), flock.SetFlag(os.O_RDONLY))
+		runLock := flock.New(filepath.Join(runDir, runLockName), flock.SetFlag(os.O_RDONLY))
 		locked, err := runLock.TryLock()
 		if err != nil {
 			_ = runLock.Close()

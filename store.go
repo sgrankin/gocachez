@@ -63,6 +63,15 @@ const cacheSchemaVersion = 2
 // 650MiB on the key index alone. WITHOUT ROWID makes entries its own primary-key
 // b-tree instead of carrying a second copy.
 //
+// runs.path is relative to the version directory, with forward slashes, and there
+// is no lock_path: the lock is always runLockName inside the run directory. Both
+// were absolute, which put the mount point in the catalog. A process seeing the
+// same cache at a different path — a container bind mount against the host, say —
+// would fail to resolve another run's directory, take the "the directory is gone"
+// branch, and delete the row for a build that is still running. Every deletion of
+// a blob is guarded by there being no registered runs, so that turns a live build
+// invisible to the one safety condition maintenance has.
+//
 // STRICT is what keeps that decision honest. Without it a hex string bound to a
 // BLOB column is stored as TEXT and never compares equal to the key it was meant
 // to be, so the row is invisible rather than wrong and nothing reports a problem.
@@ -91,7 +100,6 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE TABLE IF NOT EXISTS runs (
 	run_id TEXT PRIMARY KEY,
 	path TEXT NOT NULL,
-	lock_path TEXT NOT NULL,
 	created_at INTEGER NOT NULL
 ) STRICT;
 `
@@ -192,6 +200,11 @@ func sweepStampPath(versionDir string) string {
 
 const runDirPrefix = "run-"
 
+// runLockName is the file a run holds a lock on for as long as it is using the
+// cache. It lives inside the run directory, which is what lets runs.path stand for
+// both.
+const runLockName = "run.lock"
+
 // liveShardName spreads run directories over 100 shards. os.MkdirTemp names them
 // with a decimal random suffix, whose low digits are uniform, so the last two
 // characters need no hashing. Names are digits rather than the hex that blobs and
@@ -277,7 +290,7 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 	if sharded := filepath.Join(shard, runID); os.Rename(runDir, sharded) == nil {
 		runDir = sharded
 	}
-	runLock := flock.New(filepath.Join(runDir, "run.lock"))
+	runLock := flock.New(filepath.Join(runDir, runLockName))
 	if err := runLock.Lock(); err != nil {
 		_ = runLock.Close()
 		_ = os.RemoveAll(runDir)
@@ -470,8 +483,12 @@ func (st *store) close() {
 }
 
 func (st *store) registerRun() error {
+	relDir, err := filepath.Rel(st.versionDir, st.runDir)
+	if err != nil {
+		return fmt.Errorf("relativize run dir: %w", err)
+	}
 	now := unixMillis(time.Now())
-	if err := st.q.registerRun(context.Background(), st.runID, st.runDir, st.runLock.Path(), now); err != nil {
+	if err := st.q.registerRun(context.Background(), st.runID, filepath.ToSlash(relDir), now); err != nil {
 		return fmt.Errorf("register run: %w", err)
 	}
 	return nil
@@ -519,7 +536,7 @@ func (st *store) prepareLiveRunForClose() (bool, error) {
 			}
 			return fmt.Errorf("read live run dir: %w", err)
 		}
-		if d.IsDir() || d.Name() == "run.lock" {
+		if d.IsDir() || d.Name() == runLockName {
 			return nil
 		}
 		if !d.Type().IsRegular() {
@@ -605,7 +622,7 @@ func (st *store) cleanupAbandonedRuns() error {
 	// — reclaim would stop for good, silently, while live/ grew without bound.
 	var errs error
 	for _, run := range runs {
-		reclaimed, err := st.tryReclaimRun(run.runID, run.path, run.lockPath)
+		reclaimed, err := st.tryReclaimRun(run.runID, run.path)
 		if err != nil {
 			errs = errors.Join(errs, err)
 			continue
@@ -617,7 +634,12 @@ func (st *store) cleanupAbandonedRuns() error {
 	return errs
 }
 
-func (st *store) tryReclaimRun(runID, runDir, lockPath string) (bool, error) {
+// tryReclaimRun resolves relDir against this process's view of the cache, so a
+// cache reached by a different path than the run that registered it still finds
+// the directory.
+func (st *store) tryReclaimRun(runID, relDir string) (bool, error) {
+	runDir := filepath.Join(st.versionDir, filepath.FromSlash(relDir))
+	lockPath := filepath.Join(runDir, runLockName)
 	if _, err := os.Stat(runDir); errors.Is(err, os.ErrNotExist) {
 		if err := st.q.deleteRun(context.Background(), runID); err != nil {
 			return false, fmt.Errorf("delete missing-run record: %w", err)

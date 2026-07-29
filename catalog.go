@@ -83,9 +83,9 @@ type catalog struct {
 }
 
 type catalogRun struct {
-	runID    string
-	path     string
-	lockPath string
+	runID string
+	// path is relative to the version directory, forward-slashed.
+	path string
 }
 
 type catalogOutput struct {
@@ -138,18 +138,18 @@ func (c *catalog) close() error {
 	return err
 }
 
-func (c *catalog) registerRun(ctx context.Context, runID, path, lockPath string, createdAt int64) error {
+func (c *catalog) registerRun(ctx context.Context, runID, path string, createdAt int64) error {
 	_, err := c.db.ExecContext(ctx, `
-INSERT OR REPLACE INTO runs(run_id, path, lock_path, created_at)
-VALUES (?, ?, ?, ?)`,
-		runID, path, lockPath, createdAt,
+INSERT OR REPLACE INTO runs(run_id, path, created_at)
+VALUES (?, ?, ?)`,
+		runID, path, createdAt,
 	)
 	return err
 }
 
 func (c *catalog) listOtherRuns(ctx context.Context, runID string) ([]catalogRun, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT run_id, path, lock_path
+SELECT run_id, path
 FROM runs
 WHERE run_id != ?`, runID)
 	if err != nil {
@@ -160,7 +160,7 @@ WHERE run_id != ?`, runID)
 	var runs []catalogRun
 	for rows.Next() {
 		var run catalogRun
-		if err := rows.Scan(&run.runID, &run.path, &run.lockPath); err != nil {
+		if err := rows.Scan(&run.runID, &run.path); err != nil {
 			return nil, err
 		}
 		runs = append(runs, run)

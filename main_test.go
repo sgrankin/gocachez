@@ -956,11 +956,7 @@ func TestCleanupDropsMissingRunRecord(t *testing.T) {
 	}
 	defer st.close()
 
-	missingRunDir := filepath.Join(st.liveRoot, "run-missing")
-	missingLock := filepath.Join(missingRunDir, "run.lock")
-	if err := st.q.registerRun(context.Background(), "run-missing", missingRunDir, missingLock, unixMillis(time.Now())); err != nil {
-		t.Fatal(err)
-	}
+	registerRunDir(t, st, "run-missing", filepath.Join(st.liveRoot, "run-missing"))
 	if err := st.cleanupAbandonedRuns(); err != nil {
 		t.Fatal(err)
 	}
@@ -990,19 +986,13 @@ func TestCleanupReclaimsPastARunItCannotReclaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
-	if err := st.q.registerRun(context.Background(), "run-unreclaimable", blocked,
-		filepath.Join(blocked, "run.lock"), unixMillis(time.Now())); err != nil {
-		t.Fatal(err)
-	}
+	registerRunDir(t, st, "run-unreclaimable", blocked)
 
 	reclaimable := filepath.Join(st.liveRoot, "run-reclaimable")
 	if err := os.MkdirAll(reclaimable, 0o777); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.q.registerRun(context.Background(), "run-reclaimable", reclaimable,
-		filepath.Join(reclaimable, "run.lock"), unixMillis(time.Now())); err != nil {
-		t.Fatal(err)
-	}
+	registerRunDir(t, st, "run-reclaimable", reclaimable)
 
 	// The failure is still reported; it just no longer stops the walk.
 	if err := st.cleanupAbandonedRuns(); err == nil {
@@ -2005,7 +1995,7 @@ func TestPruneDoesNotCreateRunLockWhileCheckingLiveRuns(t *testing.T) {
 	if _, err := st.planPrune(time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(runDir, "run.lock")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(runDir, runLockName)); !os.IsNotExist(err) {
 		t.Fatalf("planning created run.lock: stat err = %v, want not exist", err)
 	}
 }
@@ -3926,13 +3916,10 @@ func TestRunPruneReclaimsAKilledRunYoungerThanTheCutoff(t *testing.T) {
 	if err := os.WriteFile(artifact, bytes.Repeat([]byte("artifact"), 512), 0o666); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(killed, "run.lock"), nil, 0o666); err != nil {
+	if err := os.WriteFile(filepath.Join(killed, runLockName), nil, 0o666); err != nil {
 		t.Fatal(err)
 	}
-	if err := busy.q.registerRun(context.Background(), "run-killed", killed,
-		filepath.Join(killed, "run.lock"), unixMillis(time.Now())); err != nil {
-		t.Fatal(err)
-	}
+	registerRunDir(t, busy, "run-killed", killed)
 
 	var stdout bytes.Buffer
 	if err := run([]string{"prune", "-dir", cacheDir, "-max-retained-age", "1h"}, strings.NewReader(""), &stdout); err != nil {
@@ -4290,7 +4277,7 @@ func TestStatusSkipsRunDirWithoutLockFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertContains(t, stdout.String(), "Live runs           0 active, 0 inactive")
-	if _, err := os.Stat(filepath.Join(runDir, "run.lock")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(runDir, runLockName)); !os.IsNotExist(err) {
 		t.Fatalf("status created run.lock: stat err = %v, want not exist", err)
 	}
 }
@@ -6209,5 +6196,70 @@ func TestPruneReapsAStaleEntryWhoseOutputIsStillWarm(t *testing.T) {
 	}
 	if _, err := os.Stat(st.blobPath(hexOf(shared))); err != nil {
 		t.Fatalf("the shared blob was removed while still in use: %v", err)
+	}
+}
+
+// registerRunDir registers dir the way a live run does: by its path relative to the
+// version directory, so tests exercise the same resolution the store does.
+func registerRunDir(t *testing.T, st *store, runID, dir string) {
+	t.Helper()
+	rel, err := filepath.Rel(st.versionDir, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.q.registerRun(
+		context.Background(), runID, filepath.ToSlash(rel), unixMillis(time.Now()),
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The catalog must not record where the cache was mounted when a run started. A
+// container bind mount and the host see one cache at two paths, and a run recorded
+// under the other one used to look like a directory that had already gone: the row
+// was dropped and the directory left behind. Dropping the row of a build that is
+// still running is the worse half, because every blob deletion is guarded by there
+// being no registered runs.
+func TestAbandonedRunIsReclaimedAfterTheCacheMoves(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	before := filepath.Join(root, "before")
+	st, err := newStore(config{dir: before})
+	if err != nil {
+		t.Fatal(err)
+	}
+	abandoned := filepath.Join(st.liveRoot, "run-moved")
+	if err := os.MkdirAll(abandoned, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(abandoned, runLockName), nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	registerRunDir(t, st, "run-moved", abandoned)
+	st.close()
+
+	// The same cache, reached by a path that did not exist when the run registered.
+	after := filepath.Join(root, "after")
+	if err := os.Rename(before, after); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := newStore(config{dir: after})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer moved.close()
+
+	if err := moved.cleanupAbandonedRuns(); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRunRows(t, moved.db, "run-moved"); got != 0 {
+		t.Errorf("moved run rows = %d, want 0", got)
+	}
+	// Forgetting the row is not enough: the directory it named has to go too, or
+	// live/ grows without bound every time the cache is reached by a new path.
+	relocated := filepath.Join(moved.versionDir, "live", "run-moved")
+	if _, err := os.Stat(relocated); !os.IsNotExist(err) {
+		t.Errorf("abandoned run dir stat err = %v, want not exist", err)
 	}
 }

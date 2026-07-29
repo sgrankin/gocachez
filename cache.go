@@ -1040,7 +1040,7 @@ func (st *store) removeExpiredRetainedFiles(paths []string, cutoff time.Time) er
 }
 
 func liveRunExpiredIfUnlocked(runDir string, cutoff time.Time) (bool, error) {
-	runLock := flock.New(filepath.Join(runDir, "run.lock"), flock.SetFlag(os.O_RDONLY))
+	runLock := flock.New(filepath.Join(runDir, runLockName), flock.SetFlag(os.O_RDONLY))
 	locked, err := runLock.TryLock()
 	if err != nil {
 		_ = runLock.Close()
@@ -1069,7 +1069,7 @@ func liveRunExpiredIfUnlocked(runDir string, cutoff time.Time) (bool, error) {
 }
 
 func retainedLiveRunExpired(runDir string, cutoff time.Time) (bool, error) {
-	info, err := os.Stat(filepath.Join(runDir, "run.lock"))
+	info, err := os.Stat(filepath.Join(runDir, runLockName))
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}

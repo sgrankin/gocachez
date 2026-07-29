@@ -115,7 +115,7 @@ func (st *store) removeUnusedLiveDirs() (bool, error) {
 
 	active := false
 	for _, runDir := range runDirs {
-		runLock := flock.New(filepath.Join(runDir, "run.lock"))
+		runLock := flock.New(filepath.Join(runDir, runLockName))
 		locked, err := runLock.TryLock()
 		if err != nil {
 			_ = runLock.Close()
