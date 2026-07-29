@@ -6904,3 +6904,93 @@ func TestStripeLocksLiveInTheCacheNotTheWorkingDirectory(t *testing.T) {
 		t.Errorf("stripe lock is not in the cache: %v", err)
 	}
 }
+
+// A live file that cannot be read used to abort the whole close: prepareLiveRunForClose
+// returned false, and unregisterRun removes the run directory when nothing was retained
+// — so one unreadable file took away every go list path the run had already published.
+// Those paths have escaped to the build; they are not this function's to withdraw.
+func TestOneUnreadableLiveFileDoesNotDiscardTheRetainedRun(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 64))
+	res, err := st.put(request{
+		ID: 1, Command: cmdPut,
+		ActionID: bytes.Repeat([]byte{91}, 32),
+		OutputID: bytes.Repeat([]byte{92}, 32),
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DiskPath == "" {
+		t.Fatal("put returned no live path")
+	}
+
+	// Sorts before the archive's own name in the same directory, so the walk meets it
+	// first — which is the case that used to lose everything.
+	blocked := filepath.Join(filepath.Dir(res.DiskPath), "0000unreadable.a")
+	if err := os.WriteFile(blocked, []byte("!<arch>\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(blocked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o600) })
+
+	st.close()
+
+	if _, err := os.Stat(res.DiskPath); err != nil {
+		t.Errorf("the run's retained live path was discarded: %v", err)
+	}
+}
+
+// Same policy where the walk itself fails rather than one file: a shard that cannot be
+// opened must not take away the paths retained from the shards already visited.
+func TestAnUnreadableShardDoesNotDiscardTheRetainedRun(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 64))
+	res, err := st.put(request{
+		ID: 1, Command: cmdPut,
+		ActionID: bytes.Repeat([]byte{93}, 32),
+		OutputID: bytes.Repeat([]byte{0x92}, 32),
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Live files sit one shard deep, and the archive above is in shard 92. A shard that
+	// sorts after it, unopenable, makes the walk fail only once something is retained.
+	blocked := filepath.Join(st.runDir, "ff")
+	if err := os.Mkdir(blocked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blocked, "x.a"), []byte("!<arch>\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(blocked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
+
+	retained, err := st.prepareLiveRunForClose()
+	if err == nil {
+		t.Fatal("expected the unreadable shard to fail the walk")
+	}
+	if !retained {
+		t.Error("reported nothing retained, so unregisterRun would remove the run directory")
+	}
+	if _, err := os.Stat(res.DiskPath); err != nil {
+		t.Errorf("the retained live path is gone: %v", err)
+	}
+}

@@ -536,12 +536,17 @@ func (st *store) registerRun() error {
 
 func (st *store) unregisterRun() error {
 	var err error
-	if deleteErr := st.q.deleteRun(context.Background(), st.runID); deleteErr != nil {
-		err = errors.Join(err, fmt.Errorf("delete run record: %w", deleteErr))
-	}
+	// Adopting retained files happens while the run is still registered, because that
+	// registration is what defers retained-file expiry. Deleting the row first left
+	// the closing store invisible to countRuns exactly while it was hard-linking
+	// retained archives into the run — so the one pass that must not unlink them
+	// believed the cache was idle.
 	retainedLiveFiles, prepareErr := st.prepareLiveRunForClose()
 	if prepareErr != nil {
 		err = errors.Join(err, prepareErr)
+	}
+	if deleteErr := st.q.deleteRun(context.Background(), st.runID); deleteErr != nil {
+		err = errors.Join(err, fmt.Errorf("delete run record: %w", deleteErr))
 	}
 	if retainedLiveFiles && prepareErr == nil {
 		now := time.Now()
@@ -567,8 +572,12 @@ func (st *store) unregisterRun() error {
 // removes the rest. Live files sit one shard deep (see createLiveFile), so this
 // walks rather than reading a single directory; empty shards go at the end, since a
 // retained run directory outlives the build and should not keep 256 of them.
+// It reports whether anything was retained even when it fails. The caller removes the
+// run directory when nothing was, and a single file erroring is not grounds for
+// discarding the go list paths of every other one — those have already escaped.
 func (st *store) prepareLiveRunForClose() (bool, error) {
 	retained := false
+	var failures error
 	err := filepath.WalkDir(st.runDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -587,7 +596,13 @@ func (st *store) prepareLiveRunForClose() (bool, error) {
 		}
 		stripped, err := st.stripLivePackageArchiveToExport(path)
 		if err != nil {
-			return err
+			// Carry on rather than abandoning the walk, and keep the directory. The
+			// file is untouched, so its path may still be in use, and the paths of
+			// everything already retained have escaped to the build — a single
+			// unreadable file is no reason to take all of them away.
+			failures = errors.Join(failures, err)
+			retained = true
+			return nil
 		}
 		if stripped {
 			retained = true
@@ -599,9 +614,9 @@ func (st *store) prepareLiveRunForClose() (bool, error) {
 		return nil
 	})
 	if err != nil {
-		return false, err
+		return retained, errors.Join(failures, err)
 	}
-	return retained, removeEmptyDirs(st.runDir)
+	return retained, errors.Join(failures, removeEmptyDirs(st.runDir))
 }
 
 func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
@@ -609,26 +624,39 @@ func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
 	if outputID == "" {
 		return stripPackageArchiveToExport(path, "")
 	}
-	retained, err := stripPackageArchiveToExport(path, st.retainedPath(outputID, ".a"))
-	if err != nil {
+	// Under the output's stripe, because this is the one place where losing a file to
+	// maintenance is worse than a miss. Retaining an export archive installs it and
+	// then hard-links it back into the run; if it is unlinked in between, both the link
+	// and the copy fall back to nothing and the whole retention fails — taking with it
+	// a go list path that has already escaped to the build. Orphan collection of an
+	// evicted output's retained files takes the same stripe, and it is ungated, so the
+	// run registration cannot defer it.
+	var kind retainedTypeKind
+	var retained bool
+	if err := st.withOutputLock(outputID, func() error {
+		var err error
+		retained, err = stripPackageArchiveToExport(path, st.retainedPath(outputID, ".a"))
+		if err != nil {
+			return err
+		}
+		if retained {
+			kind = retainedTypeExportArchive
+			return nil
+		}
+		// Generated source retains the same way — install, then link back — so it is
+		// exposed to the same interruption and belongs under the same lock.
+		kind, retained, err = retainEscapedGeneratedGoSource(path, st.retainedPath(outputID, ".go"))
+		return err
+	}); err != nil {
 		return false, err
 	}
-	if retained {
-		if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeExportArchive); err != nil {
-			if st.verbose {
-				log.Printf("gocachez: cache retained file type failed: %v", err)
-			}
-		}
-		return true, nil
+	if !retained {
+		return false, nil
 	}
-	kind, retained, err := retainEscapedGeneratedGoSource(path, st.retainedPath(outputID, ".go"))
-	if err != nil || !retained {
-		return retained, err
-	}
-	if err := st.q.updateRetainedType(context.Background(), outputID, kind); err != nil {
-		if st.verbose {
-			log.Printf("gocachez: cache retained file type failed: %v", err)
-		}
+	// Recorded outside the stripe. A catalog write under a file lock can wait out a
+	// five-second busy timeout, and every build wanting this shard would wait with it.
+	if err := st.q.updateRetainedType(context.Background(), outputID, kind); err != nil && st.verbose {
+		log.Printf("gocachez: cache retained file type failed: %v", err)
 	}
 	return true, nil
 }
