@@ -6483,3 +6483,55 @@ func TestPutStampsABlobItDidNotInstall(t *testing.T) {
 			time.Since(info.ModTime()))
 	}
 }
+
+// A completed scan has to leave the write-ahead log short. SQLite reuses the log
+// from the start rather than shortening it, so without this its high-water mark is
+// permanent and every reader searches all of it for frames.
+func TestScanTruncatesTheWriteAheadLog(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	// Enough puts to put real frames in the log.
+	for i := range 40 {
+		body := incompressibleBody(t, 8<<10, int64(i))
+		if _, err := st.put(request{
+			ID: int64(i), Command: cmdPut,
+			ActionID: bytes.Repeat([]byte{byte(i)}, 32),
+			OutputID: bytes.Repeat([]byte{byte(i + 100)}, 32),
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	walPath := filepath.Join(st.versionDir, "cache.db-wal")
+	before, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() == 0 {
+		t.Fatal("no write-ahead log to truncate, so this proves nothing")
+	}
+
+	if _, err := st.db.ExecContext(context.Background(),
+		`DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	ageCacheFiles(t, st)
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() >= before.Size() {
+		t.Errorf("write-ahead log is %d bytes after a scan, was %d", after.Size(), before.Size())
+	}
+}

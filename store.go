@@ -410,13 +410,25 @@ const readTuning = "&_pragma=mmap_size(2147483648)"
 // the 32KiB wal-index gives away.
 const walTuning = "&_pragma=journal_size_limit(67108864)"
 
+// maxConcurrency bounds both the requests served at once and the catalog
+// connections open at once, and they are deliberately the same number: a connection
+// exists to serve a request in flight, so a smaller pool would queue requests that
+// have nowhere else to wait, and a larger one would hold connections no request can
+// reach. Changing one without the other is always a mistake.
+func maxConcurrency() int {
+	return min(max(runtime.GOMAXPROCS(0), 1), 8)
+}
+
 func openDB(path string) (*sql.DB, error) {
-	dsn := "file:" + url.PathEscape(filepath.ToSlash(path)) + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)" + readTuning + walTuning
+	// foreign_keys is deliberately absent: the schema declares no foreign key, and
+	// says why. Asking for enforcement of a constraint that does not exist only
+	// suggests to a reader that entries and outputs are kept consistent for them.
+	dsn := "file:" + url.PathEscape(filepath.ToSlash(path)) + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)" + readTuning + walTuning
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open catalog: %w", err)
 	}
-	conns := min(max(runtime.GOMAXPROCS(0), 1), 8)
+	conns := maxConcurrency()
 	db.SetMaxOpenConns(conns)
 	db.SetMaxIdleConns(conns)
 	if err := initDB(db); err != nil {

@@ -799,7 +799,11 @@ func (st *store) applyPrune(plan prunePlan) error {
 		if err := st.deletePlanned(plan); err != nil {
 			return err
 		}
-		return st.markPruned()
+		if err := st.markPruned(); err != nil {
+			return err
+		}
+		st.checkpointWAL()
+		return nil
 	})
 	if err == nil && !applied && st.verbose {
 		log.Print("gocachez: skipped maintenance, another process holds the cache lock")
@@ -973,6 +977,25 @@ func (st *store) sweepUnlocked(now time.Time) error {
 // minute leaves two orders of magnitude of headroom, and keeping it short is what
 // makes the disk come back promptly instead of an hour later.
 const orphanGrace = time.Minute
+
+// checkpointWAL folds the write-ahead log back into the database and truncates it.
+//
+// SQLite reuses the log from the start rather than shortening it, so its high-water
+// mark is permanent: one host was carrying 611MiB of log against 16MiB in use, and
+// every reader was searching that for frames — a profile of a busy machine showed
+// walFindFrame among the top costs. journal_size_limit bounds the log the next time
+// it resets; this returns it now, and leaves readers finding their pages in the
+// mapped database instead of the log.
+//
+// It is the log being truncated, not the mapped database, which is the file the
+// warning on readTuning is about. Called only from a pass that holds the lifecycle
+// lock with no run registered, and failure is not worth reporting upward: a reader
+// that has not finished blocks it, and the next pass will get it.
+func (st *store) checkpointWAL() {
+	if _, err := st.db.ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil && st.verbose {
+		log.Printf("gocachez: truncating the write-ahead log failed: %v", err)
+	}
+}
 
 // keepEveryOutput disables the access-time filter in referencedInShard. Zero
 // would not do: accessed_at can be negative if the clock was ever behind 1970,

@@ -118,7 +118,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 	// serving is held while a request is being handled, so a shutdown can wait for
 	// one to finish rather than strip the live files it is still writing.
 	var serving sync.Mutex
-	sem := make(chan struct{}, min(max(runtime.GOMAXPROCS(0), 1), 8))
+	sem := make(chan struct{}, maxConcurrency())
 
 	// Only the real helper takes over process-wide signals. A test passes its own
 	// reader, and must not have a stray SIGTERM reach an os.Exit(0) that would end
