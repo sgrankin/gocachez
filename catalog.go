@@ -214,9 +214,6 @@ func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
 	return nil
 }
 
-// txExec runs one statement in tx, using the catalog's prepared version when it
-// has one. A catalog built for a one-shot read (see newCatalog callers that never
-// call prepare) has none, and parses the SQL instead.
 // txQueryInt64 is txExec for a statement with a RETURNING clause. It scans here
 // rather than handing back a *sql.Row, because the tx-bound statement has to
 // outlive the scan and be closed after it.
@@ -230,6 +227,9 @@ func txQueryInt64(ctx context.Context, tx *sql.Tx, stmt *sql.Stmt, query string,
 	return value, bound.QueryRowContext(ctx, args...).Scan(&value)
 }
 
+// txExec runs one statement in tx, using the catalog's prepared version when it has
+// one. A catalog built for a one-shot read (see newCatalog callers that never call
+// prepare) has none, and parses the SQL instead.
 func txExec(ctx context.Context, tx *sql.Tx, stmt *sql.Stmt, query string, args ...any) error {
 	if stmt == nil {
 		_, err := tx.ExecContext(ctx, query, args...)
@@ -332,34 +332,161 @@ WHERE output_id = ? AND accessed_at <= ?`, idKey(outputID), accessedAt)
 	return rows > 0, err
 }
 
+// ageBatch bounds how many rows one age-expiry transaction removes.
+//
+// SQLite has a single writer and gives a competing one a five-second busy timeout,
+// after which its statement fails rather than waiting — and a put that fails reaches
+// the go command as an error, not as a cache miss. Age expiry stopped waiting for an
+// idle cache, so it now runs against live builds, and one DELETE across a
+// multi-million-row catalog is a build failure waiting for a cache big enough.
+// classificationBatch exists for this reason, measured on the same host: a single
+// 200k-row transaction stalled a concurrent put for 3.9s of its 5s.
+const ageBatch = 2000
+
 // deleteAccessedBefore expires both tables. outputs is the one that frees disk:
 // its rows are what keeps a blob from being an orphan, so an implementation that
 // reaped only entries would leave maxAge quietly reclaiming nothing.
 func (c *catalog) deleteAccessedBefore(ctx context.Context, cutoff int64) (reaped, error) {
-	entries, err := deleteAccessedBeforeIn(ctx, c.db, "entries", cutoff)
+	entries, err := c.deleteStaleEntries(ctx, cutoff)
 	if err != nil {
 		return reaped{}, err
 	}
-	outputs, err := deleteAccessedBeforeIn(ctx, c.db, "outputs", cutoff)
+	outputs, err := c.deleteStaleOutputs(ctx, cutoff)
 	if err != nil {
-		return reaped{}, err
+		return reaped{entries: entries}, err
 	}
 	return reaped{entries: entries, outputs: outputs}, nil
+}
+
+// deleteStaleEntries walks the table in primary-key order, carrying a cursor so the
+// scan resumes where the last batch stopped. entries has no index on accessed_at —
+// see catalogSchema for why — so every batch is a scan.
+//
+// The cursor bounds cost, not correctness: without it each batch restarts at the
+// beginning and still finds the rows it should, because the ones it already removed
+// are gone. What it costs is the tail, where few stale rows are left and each batch
+// scans most of the surviving table to fill itself. Over 7.7M entries with an eighth
+// of them stale that is roughly six passes rather than one. No test asserting what
+// survives can tell the two apart, so this comment is the only thing recording why the
+// cursor is here.
+func (c *catalog) deleteStaleEntries(ctx context.Context, cutoff int64) (int64, error) {
+	var total int64
+	var cursor []byte
+	for {
+		ids, err := c.staleActionIDs(ctx, cutoff, cursor)
+		if err != nil {
+			return total, err
+		}
+		if len(ids) == 0 {
+			return total, nil
+		}
+		removed, err := deleteByKey(ctx, c.db, `DELETE FROM entries WHERE action_id = ?`, ids)
+		total += removed
+		if err != nil {
+			return total, err
+		}
+		cursor = ids[len(ids)-1]
+	}
+}
+
+func (c *catalog) staleActionIDs(ctx context.Context, cutoff int64, after []byte) ([][]byte, error) {
+	if after == nil {
+		// No BLOB sorts below the empty one, so this matches every key.
+		after = []byte{}
+	}
+	rows, err := c.db.QueryContext(ctx, `
+SELECT action_id FROM entries
+WHERE accessed_at < ? AND action_id > ?
+ORDER BY action_id
+LIMIT ?`, cutoff, after, ageBatch)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	return scanKeys(rows)
+}
+
+// deleteStaleOutputs needs no cursor: outputs_accessed_at makes finding the next batch
+// a seek rather than a scan, so removing one batch leaves the next at hand.
+func (c *catalog) deleteStaleOutputs(ctx context.Context, cutoff int64) (int64, error) {
+	var total int64
+	for {
+		ids, err := c.staleOutputIDs(ctx, cutoff)
+		if err != nil {
+			return total, err
+		}
+		if len(ids) == 0 {
+			return total, nil
+		}
+		removed, err := deleteByKey(ctx, c.db, `DELETE FROM outputs WHERE output_id = ?`, ids)
+		total += removed
+		if err != nil {
+			return total, err
+		}
+	}
+}
+
+func (c *catalog) staleOutputIDs(ctx context.Context, cutoff int64) ([][]byte, error) {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT output_id FROM outputs WHERE accessed_at < ? ORDER BY accessed_at LIMIT ?`, cutoff, ageBatch)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	return scanKeys(rows)
+}
+
+func scanKeys(rows *sql.Rows) ([][]byte, error) {
+	var keys [][]byte
+	for rows.Next() {
+		var key []byte
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
+// deleteByKey removes one batch in one transaction, by primary key, through a single
+// prepared statement — the same shape as commitClassifications and for the same
+// reason: the point is to bound how long the write lock is held, not to issue the
+// fewest statements.
+func deleteByKey(ctx context.Context, db catalogDB, query string, keys [][]byte) (int64, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin age-expiry transaction: %w", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, query)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, fmt.Errorf("prepare age-expiry delete: %w", err)
+	}
+	defer stmt.Close() //nolint:errcheck
+	var removed int64
+	for _, key := range keys {
+		res, err := stmt.ExecContext(ctx, key)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, fmt.Errorf("age-expiry delete: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		removed += n
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit age-expiry transaction: %w", err)
+	}
+	return removed, nil
 }
 
 // reaped counts what an age pass removed from each table.
 type reaped struct {
 	entries int64
 	outputs int64
-}
-
-func deleteAccessedBeforeIn(ctx context.Context, db catalogDB, table string, cutoff int64) (int64, error) {
-	// table is one of two literals above, never caller input.
-	res, err := db.ExecContext(ctx, "DELETE FROM "+table+" WHERE accessed_at < ?", cutoff)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
 }
 
 func (c *catalog) compressedSize(ctx context.Context) (int64, error) {

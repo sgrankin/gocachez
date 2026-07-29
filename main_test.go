@@ -6674,3 +6674,61 @@ func TestFailedAccessFlushKeepsItsHits(t *testing.T) {
 		t.Error("a failed flush discarded the output hits it was carrying")
 	}
 }
+
+// Age expiry removes rows in bounded transactions so it cannot hold SQLite's single
+// write lock past a concurrent put's busy timeout. That means a loop and a cursor, and
+// both need more than one batch to be exercised: a single-batch implementation passes
+// every smaller test. Stale and fresh rows alternate so the cursor has to carry past
+// survivors rather than restart at them.
+func TestAgeExpiryRemovesEveryStaleRowAcrossBatches(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	const rows = ageBatch*2 + 250
+	stale := unixMillis(trimCutoff(defaultMaxAge, time.Now())) - int64(time.Minute/time.Millisecond)
+	fresh := unixMillis(time.Now())
+
+	ctx := context.Background()
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wantFresh int
+	for i := range rows {
+		action := sha256.Sum256(fmt.Appendf(nil, "batched-action-%d", i))
+		at := stale
+		if i%2 == 1 {
+			at, wantFresh = fresh, wantFresh+1
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO entries(action_id, output, created_at, accessed_at) VALUES (?, 1, ?, ?)`,
+			action[:], fresh, at,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.q.deleteAccessedBefore(ctx, unixMillis(trimCutoff(defaultMaxAge, time.Now())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(rows - wantFresh); got.entries != want {
+		t.Errorf("removed %d entries, want %d", got.entries, want)
+	}
+
+	var surviving int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM entries`).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving != wantFresh {
+		t.Errorf("%d entries survived, want %d — a batch was skipped or the cursor stalled", surviving, wantFresh)
+	}
+}
