@@ -6870,3 +6870,37 @@ func TestPutAndEvictionDoNotRaceOverTheSameOutput(t *testing.T) {
 	default:
 	}
 }
+
+// Two commands build a store by hand rather than through newStore, and both once
+// omitted the stripe directory, so withOutputLock took its lock in the process working
+// directory instead of the cache — littering the caller's CWD and, worse, taking a
+// different lock than the builds it is meant to serialise against. The path is derived
+// now; this is what stops it being forgotten again.
+func TestStripeLocksLiveInTheCacheNotTheWorkingDirectory(t *testing.T) {
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	// Run from a directory of its own so a stray lock is unmistakable.
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+
+	outputHex := strings.Repeat("2f", 32)
+	if err := st.withOutputLock(outputHex, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	strays, err := filepath.Glob(filepath.Join(cwd, "*.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strays) != 0 {
+		t.Errorf("stripe lock landed in the working directory: %v", strays)
+	}
+	if _, err := os.Stat(filepath.Join(st.versionDir, "stripes", "2f.lock")); err != nil {
+		t.Errorf("stripe lock is not in the cache: %v", err)
+	}
+}

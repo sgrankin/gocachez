@@ -1082,7 +1082,7 @@ func (st *store) removeStalePendingBlobs(now time.Time) error {
 // ordering to get wrong. Maintenance takes the maintenance lock outside these; a build
 // takes only these.
 func (st *store) withOutputLock(outputHex string, fn func() error) error {
-	return withFileLock(filepath.Join(st.stripesDir, outputShard(outputHex)+".lock"), fn)
+	return withFileLock(filepath.Join(stripesDir(st.versionDir), outputShard(outputHex)+".lock"), fn)
 }
 
 // orphanGrace is how recently a file may have been written and still be spared by

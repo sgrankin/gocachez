@@ -27,10 +27,15 @@ import (
 // helpers may start at any moment buys nothing.
 const cacheSchemaVersion = 2
 
-// catalogSchema is complete: every version-2 catalog is created from it, so there
-// is no migration path to keep. Adding to it later has to be additive, because
-// the version in the path lets an older binary of the same version open the
-// result; anything else bumps cacheSchemaVersion.
+// catalogSchema is complete: every version-2 catalog is created from it, so there is no
+// migration path to keep. That makes the rule for changing it simple and strict — any
+// change bumps cacheSchemaVersion.
+//
+// Adding a column is not an exception. CREATE TABLE IF NOT EXISTS does nothing to a
+// table that already exists, so a new column never reaches a catalog an earlier build
+// created: the next lookup fails to prepare and takes the helper down with it, failing
+// builds rather than missing them. Nor is dropping an index or widening a value, since
+// the version in the path is what lets two binaries share a directory safely.
 //
 // outputs is the inventory of what is on disk: one row per blob, holding the facts
 // that belong to the content rather than to any action that produced it. entries
@@ -133,7 +138,6 @@ type store struct {
 	q                 *catalog
 	versionDir        string
 	blobsDir          string
-	stripesDir        string
 	liveRoot          string
 	lifecycleLockPath string
 	runID             string
@@ -334,7 +338,6 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 		q:                 newCatalog(db),
 		versionDir:        versionDir,
 		blobsDir:          blobsDir,
-		stripesDir:        stripesDir(versionDir),
 		liveRoot:          liveRoot,
 		lifecycleLockPath: lifecycleLockPath,
 		runID:             runID,
