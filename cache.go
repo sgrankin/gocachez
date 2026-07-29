@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -235,13 +234,9 @@ func (st *store) get(req request) (response, error) {
 
 	st.markEntryAccess(actionHex)
 
-	outputID, err := hex.DecodeString(ent.OutputID)
-	if err != nil {
-		return response{}, fmt.Errorf("decode output ID: %w", err)
-	}
 	return response{
 		ID:       req.ID,
-		OutputID: outputID,
+		OutputID: idKey(ent.OutputID),
 		Size:     ent.Size,
 		Time:     &ent.CreatedAt,
 		DiskPath: path,
@@ -1173,6 +1168,9 @@ func (st *store) removeOrphans(orphans map[int][]string) error {
 	return nil
 }
 
+// lastOutputShard is the highest shard byte, which needs an open upper bound.
+const lastOutputShard = 255
+
 func shardPrefix(shard int) string {
 	return fmt.Sprintf("%02x", shard)
 }
@@ -1194,19 +1192,9 @@ func (st *store) addRetainedCandidates(orphans map[int][]string, outputIDs []str
 	}
 }
 
-// referencedInShard replaces outputIDs with the output IDs that the given
-// shard's entries reference. Entries accessed before minAccessedAt are ignored,
-// which lets a scan plan around the entries it is about to delete; pass
-// keepEveryEntry to count all of them.
 func (st *store) referencedInShard(shard int, minAccessedAt int64, outputIDs map[string]struct{}) error {
-	lower := shardPrefix(shard)
-	upper := shardPrefix(shard + 1)
-	if shard == 255 {
-		// Hex digits all sort below 'g', so this is the open upper bound.
-		upper = "g"
-	}
-	if err := st.q.referencedOutputIDs(context.Background(), lower, upper, minAccessedAt, outputIDs); err != nil {
-		return fmt.Errorf("query referenced outputs in shard %s: %w", lower, err)
+	if err := st.q.referencedOutputIDs(context.Background(), shard, minAccessedAt, outputIDs); err != nil {
+		return fmt.Errorf("query referenced outputs in shard %s: %w", shardPrefix(shard), err)
 	}
 	return nil
 }

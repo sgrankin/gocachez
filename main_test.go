@@ -153,7 +153,7 @@ func TestGetMaterializesAfterLiveFileRemoved(t *testing.T) {
 	}
 }
 
-func TestGetRejectsInvalidCatalogOutputID(t *testing.T) {
+func TestGetDropsEntryWhoseBlobIsMissing(t *testing.T) {
 	t.Parallel()
 
 	st, err := newStore(config{
@@ -164,14 +164,10 @@ func TestGetRejectsInvalidCatalogOutputID(t *testing.T) {
 	}
 	defer st.close()
 
-	actionID := hexOf(bytes.Repeat([]byte{36}, 32))
-	outputID := "not-hex"
-	path := filepath.Join(st.runDir, "body")
-	if err := os.WriteFile(path, []byte("body"), 0o666); err != nil {
-		t.Fatal(err)
-	}
+	actionID := bytes.Repeat([]byte{36}, 32)
+	outputID := hexOf(bytes.Repeat([]byte{37}, 32))
 	if err := st.upsertEntry(entry{
-		ActionID:       actionID,
+		ActionID:       hexOf(actionID),
 		OutputID:       outputID,
 		Size:           4,
 		CompressedSize: 4,
@@ -180,10 +176,17 @@ func TestGetRejectsInvalidCatalogOutputID(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	st.setMaterialized(outputID, path)
 
-	if _, err := st.get(request{ID: 1, Command: cmdGet, ActionID: bytes.Repeat([]byte{36}, 32)}); err == nil {
-		t.Fatal("get accepted invalid catalog output ID")
+	// No blob was ever written, so materializing has to fail with ErrNotExist.
+	res, err := st.get(request{ID: 1, Command: cmdGet, ActionID: actionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Miss {
+		t.Fatalf("get response = %+v, want miss", res)
+	}
+	if _, err := st.lookupEntry(hexOf(actionID)); !errorsIs(err, sql.ErrNoRows) {
+		t.Fatalf("entry = %v, want sql.ErrNoRows", err)
 	}
 }
 
@@ -615,7 +618,7 @@ func TestRunTreatsClosedStdinAsEndOfInput(t *testing.T) {
 
 	// The store shut down properly, so its run directory is gone rather than left
 	// for the sweep. Nothing was retained here, so the whole directory goes.
-	dirs, err := liveRunDirs(filepath.Join(cacheDir, "v1", "live"))
+	dirs, err := liveRunDirs(filepath.Join(testVersionDir(cacheDir), "live"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -637,7 +640,7 @@ func TestRunClosesCleanlyOnAReadError(t *testing.T) {
 		t.Fatal("a malformed request was accepted")
 	}
 
-	dirs, err := liveRunDirs(filepath.Join(cacheDir, "v1", "live"))
+	dirs, err := liveRunDirs(filepath.Join(testVersionDir(cacheDir), "live"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -805,7 +808,7 @@ func TestVersionedLayout(t *testing.T) {
 	}
 	defer st.close()
 
-	wantVersionDir := filepath.Join(cacheDir, "v1")
+	wantVersionDir := testVersionDir(cacheDir)
 	if st.versionDir != wantVersionDir {
 		t.Fatalf("versionDir = %q, want %q", st.versionDir, wantVersionDir)
 	}
@@ -1275,7 +1278,7 @@ func TestRefreshingRetainedFileDoesNotKeepOldLiveRun(t *testing.T) {
 	if err := os.Chtimes(filepath.Join(runDirOf(first.DiskPath), "run.lock"), old, old); err != nil {
 		t.Fatal(err)
 	}
-	expireMaintenanceStamps(t, filepath.Join(cacheDir, "v1"))
+	expireMaintenanceStamps(t, testVersionDir(cacheDir))
 
 	st, err = newStore(config{
 		dir:    cacheDir,
@@ -1477,10 +1480,10 @@ func TestNewStoreUsesLifecycleLock(t *testing.T) {
 	t.Parallel()
 
 	cacheDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(cacheDir, "v1"), 0o777); err != nil {
+	if err := os.MkdirAll(testVersionDir(cacheDir), 0o777); err != nil {
 		t.Fatal(err)
 	}
-	lock := flock.New(filepath.Join(cacheDir, "v1", "lifecycle.lock"))
+	lock := flock.New(filepath.Join(testVersionDir(cacheDir), "lifecycle.lock"))
 	if err := lock.Lock(); err != nil {
 		t.Fatal(err)
 	}
@@ -1724,7 +1727,7 @@ func TestEvictionKeepsAnOutputReadDuringPlanning(t *testing.T) {
 	for i, output := range outputs {
 		if _, err := st.db.ExecContext(context.Background(),
 			`UPDATE entries SET accessed_at = ? WHERE output_id = ?`,
-			unixMillis(time.Now())-int64(len(outputs)-i)*1000, hexOf(output)); err != nil {
+			unixMillis(time.Now())-int64(len(outputs)-i)*1000, idKey(hexOf(output))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1750,7 +1753,7 @@ func TestEvictionKeepsAnOutputReadDuringPlanning(t *testing.T) {
 	// what the periodic flush now makes visible mid-pass.
 	if _, err := st.db.ExecContext(context.Background(),
 		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`,
-		unixMillis(time.Now()), coldest); err != nil {
+		unixMillis(time.Now()), idKey(coldest)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1764,7 +1767,7 @@ func TestEvictionKeepsAnOutputReadDuringPlanning(t *testing.T) {
 	}
 	var surviving int
 	if err := st.db.QueryRowContext(context.Background(),
-		`SELECT COUNT(*) FROM entries WHERE output_id = ?`, coldest).Scan(&surviving); err != nil {
+		`SELECT COUNT(*) FROM entries WHERE output_id = ?`, idKey(coldest)).Scan(&surviving); err != nil {
 		t.Fatal(err)
 	}
 	if surviving == 0 {
@@ -1821,11 +1824,11 @@ func TestEvictionKeepsAnOutputWhoseOtherActionWentWarm(t *testing.T) {
 
 	now := unixMillis(time.Now())
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`, now-10_000, hexOf(shared[:])); err != nil {
+		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`, now-10_000, idKey(hexOf(shared[:]))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`, now, hexOf(other[:])); err != nil {
+		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`, now, idKey(hexOf(other[:]))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
@@ -1847,7 +1850,7 @@ func TestEvictionKeepsAnOutputWhoseOtherActionWentWarm(t *testing.T) {
 
 	// One of its two actions is read and flushed while the plan is in hand.
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, now+10_000, hexOf(twoActions[0])); err != nil {
+		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, now+10_000, idKey(hexOf(twoActions[0]))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1858,7 +1861,7 @@ func TestEvictionKeepsAnOutputWhoseOtherActionWentWarm(t *testing.T) {
 
 	var surviving int
 	if err := st.db.QueryRowContext(context.Background(),
-		`SELECT COUNT(*) FROM entries WHERE output_id = ?`, hexOf(shared[:])).Scan(&surviving); err != nil {
+		`SELECT COUNT(*) FROM entries WHERE output_id = ?`, idKey(hexOf(shared[:]))).Scan(&surviving); err != nil {
 		t.Fatal(err)
 	}
 	if surviving == 0 {
@@ -1904,7 +1907,7 @@ func TestPruneEnforcesMaxSizeWhenMaxAgeAlsoFires(t *testing.T) {
 	stale := unixMillis(trimCutoff(defaultMaxAge, time.Now())) - int64(time.Minute/time.Millisecond)
 	for _, action := range actions[:3] {
 		if _, err := st.db.ExecContext(context.Background(),
-			`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, stale, hexOf(action)); err != nil {
+			`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, stale, idKey(hexOf(action))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2711,7 +2714,7 @@ func TestPruneRemovesRetainedFilesOfEvictedOutputs(t *testing.T) {
 	defer st.close()
 	if _, err := st.db.ExecContext(context.Background(),
 		`UPDATE entries SET accessed_at = ? WHERE output_id = ?`,
-		unixMillis(time.Now().Add(-time.Hour)), hexOf(evicted)); err != nil {
+		unixMillis(time.Now().Add(-time.Hour)), idKey(hexOf(evicted))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
@@ -3070,7 +3073,7 @@ func TestCatalogQueriesRespectCanceledContext(t *testing.T) {
 	if _, _, err := st.q.oldestAccessWatermark(ctx, 0, 1); err == nil {
 		t.Fatal("oldestAccessWatermark succeeded with canceled context")
 	}
-	if err := st.q.referencedOutputIDs(ctx, "00", "01", keepEveryEntry, make(map[string]struct{})); err == nil {
+	if err := st.q.referencedOutputIDs(ctx, 0, keepEveryEntry, make(map[string]struct{})); err == nil {
 		t.Fatal("referencedOutputIDs succeeded with canceled context")
 	}
 }
@@ -3103,7 +3106,7 @@ func TestEvictionStepStaysBounded(t *testing.T) {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
 			 VALUES (?, ?, 1, 1, ?, ?)`,
-			hex.EncodeToString(action[:]), hex.EncodeToString(output[:]), now, now-int64(outputs)+int64(i),
+			action[:], output[:], now, now-int64(outputs)+int64(i),
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -3182,19 +3185,21 @@ func TestPruneEvictsAcrossStepsWithoutTakingFreshOutputs(t *testing.T) {
 
 	// Everything ancient except the straddler's second action, which stays at
 	// now — so its oldest entry sits in the first step and its newest does not.
-	// Distinct times via rowid: a step has to include every entry sharing its
-	// watermark, so identical timestamps would collapse the whole cache into one
-	// step and defeat the point of the test.
+	// Distinct times: a step has to include every entry sharing its watermark, so
+	// identical timestamps would collapse the whole cache into one step and defeat
+	// the point of the test. The first byte of each action ID spreads them without
+	// needing a rowid, which a WITHOUT ROWID table does not have.
 	ancient := unixMillis(time.Now().Add(-90 * 24 * time.Hour))
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? + rowid WHERE action_id != ?`, ancient, hexOf(freshAction)); err != nil {
+		`UPDATE entries SET accessed_at = ? + 1 + unicode(hex(substr(action_id, 1, 1))) WHERE action_id != ?`,
+		ancient, idKey(hexOf(freshAction))); err != nil {
 		t.Fatal(err)
 	}
 	// Make the straddler's old entry the single oldest thing in the cache, so it
 	// falls inside the first step. Otherwise the first step never sees it and the
 	// ranking this test is about is never exercised.
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, ancient-1000, hexOf(oldAction)); err != nil {
+		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, ancient-1000, idKey(hexOf(oldAction))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
@@ -3274,7 +3279,7 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 		context.Background(),
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 		recent-3000,
-		hexOf(oldSharedActionID),
+		idKey(hexOf(oldSharedActionID)),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -3290,7 +3295,7 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 		context.Background(),
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 		recent-2000,
-		hexOf(prunedActionID),
+		idKey(hexOf(prunedActionID)),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -3373,7 +3378,7 @@ func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
 			context.Background(),
 			`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 			stale,
-			hexOf(actionID),
+			idKey(hexOf(actionID)),
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -3439,7 +3444,7 @@ func TestPruneKeepsOldEntriesWhenMaxAgeDisabled(t *testing.T) {
 		context.Background(),
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 		int64(1000),
-		hexOf(actionID),
+		idKey(hexOf(actionID)),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -3483,7 +3488,7 @@ func TestAccessTimesFlushOnClose(t *testing.T) {
 		context.Background(),
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 		int64(1000),
-		actionHex,
+		idKey(actionHex),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -3497,7 +3502,7 @@ func TestAccessTimesFlushOnClose(t *testing.T) {
 	if err := st.db.QueryRowContext(
 		context.Background(),
 		`SELECT accessed_at FROM entries WHERE action_id = ?`,
-		actionHex,
+		idKey(actionHex),
 	).Scan(&accessedAt); err != nil {
 		t.Fatal(err)
 	}
@@ -3534,14 +3539,14 @@ func TestGetPersistsAccessTimesWithoutClosing(t *testing.T) {
 		t.Helper()
 		var at int64
 		if err := st.db.QueryRowContext(context.Background(),
-			`SELECT accessed_at FROM entries WHERE action_id = ?`, actionHex).Scan(&at); err != nil {
+			`SELECT accessed_at FROM entries WHERE action_id = ?`, idKey(actionHex)).Scan(&at); err != nil {
 			t.Fatal(err)
 		}
 		return at
 	}
 
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, int64(1000), actionHex); err != nil {
+		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, int64(1000), idKey(actionHex)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3577,7 +3582,7 @@ func TestGetPersistsAccessTimesWithoutClosing(t *testing.T) {
 	// leaves every later get flushing too, which is the per-get transaction the
 	// buffer exists to avoid.
 	if _, err := st.db.ExecContext(context.Background(),
-		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, int64(2000), actionHex); err != nil {
+		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, int64(2000), idKey(actionHex)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.get(request{ID: 4, Command: cmdGet, ActionID: actionID}); err != nil {
@@ -3592,10 +3597,10 @@ func TestRunAnnouncesCommandsBeforeOpeningStore(t *testing.T) {
 	t.Parallel()
 
 	cacheDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(cacheDir, "v1"), 0o777); err != nil {
+	if err := os.MkdirAll(testVersionDir(cacheDir), 0o777); err != nil {
 		t.Fatal(err)
 	}
-	lock := flock.New(filepath.Join(cacheDir, "v1", "lifecycle.lock"))
+	lock := flock.New(filepath.Join(testVersionDir(cacheDir), "lifecycle.lock"))
 	if err := lock.Lock(); err != nil {
 		t.Fatal(err)
 	}
@@ -3811,7 +3816,7 @@ func TestRunHelpDoesNotCreateCacheState(t *testing.T) {
 	if err := run([]string{"clean", "-h", "-dir", cacheDir}, strings.NewReader(""), &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(cacheDir, "v1")); !os.IsNotExist(err) {
+	if _, err := os.Stat(testVersionDir(cacheDir)); !os.IsNotExist(err) {
 		t.Fatalf("help created cache state: %v", err)
 	}
 }
@@ -4207,7 +4212,7 @@ func TestRunStatusDoesNotWaitForLifecycleLock(t *testing.T) {
 	st.close()
 
 	// Stand in for a build holding the lock across a maintenance scan.
-	lock := flock.New(filepath.Join(cacheDir, "v1", "lifecycle.lock"))
+	lock := flock.New(filepath.Join(testVersionDir(cacheDir), "lifecycle.lock"))
 	if err := lock.Lock(); err != nil {
 		t.Fatal(err)
 	}
@@ -4243,7 +4248,7 @@ func TestStatusSkipsRunDirWithoutLockFile(t *testing.T) {
 	// status can see the dir in that state. It must neither fail nor recreate
 	// the lock: doing so would make the prune's rmdir fail and resurrect the
 	// run in the report.
-	runDir := filepath.Join(cacheDir, "v1", "live", "run-halfremoved")
+	runDir := filepath.Join(testVersionDir(cacheDir), "live", "run-halfremoved")
 	if err := os.MkdirAll(runDir, 0o777); err != nil {
 		t.Fatal(err)
 	}
@@ -4646,7 +4651,7 @@ func TestStatusReclassifiesWhenClassifierVersionChanges(t *testing.T) {
 	// The stale value is recomputed and re-stored at the current version.
 	var kind, version sql.NullInt64
 	queryCatalog(t, dbPath, `SELECT blob_type, blob_type_version FROM entries WHERE output_id = ?`,
-		[]any{hexOf(outputID)}, &kind, &version)
+		[]any{idKey(hexOf(outputID))}, &kind, &version)
 	if !kind.Valid || blobTypeKind(kind.Int64) != blobTypeGoPackageArchive {
 		t.Fatalf("cached blob_type = %v, want %d", kind, blobTypeGoPackageArchive)
 	}
@@ -4683,7 +4688,7 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 	// New retained files are classified when they are created.
 	var kind, version sql.NullInt64
 	queryCatalog(t, dbPath, `SELECT retained_type, retained_type_version FROM entries WHERE output_id = ?`,
-		[]any{outputHex}, &kind, &version)
+		[]any{idKey(outputHex)}, &kind, &version)
 	if !kind.Valid || retainedTypeKind(kind.Int64) != retainedTypeGeneratedCgoSource {
 		t.Fatalf("cached retained_type = %v, want %d", kind, retainedTypeGeneratedCgoSource)
 	}
@@ -4692,7 +4697,7 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 	}
 
 	// Simulate an older cache and verify status backfills its classification.
-	execCatalog(t, dbPath, `UPDATE entries SET retained_type = NULL, retained_type_version = NULL WHERE output_id = ?`, outputHex)
+	execCatalog(t, dbPath, `UPDATE entries SET retained_type = NULL, retained_type_version = NULL WHERE output_id = ?`, idKey(outputHex))
 	_, _, outputs, err := readCatalogStatus(dbPath, true)
 	if err != nil {
 		t.Fatal(err)
@@ -4704,7 +4709,7 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 	assertRetainedKind(t, statuses, retainedTypeGeneratedCgoSource, 1)
 
 	queryCatalog(t, dbPath, `SELECT retained_type, retained_type_version FROM entries WHERE output_id = ?`,
-		[]any{outputHex}, &kind, &version)
+		[]any{idKey(outputHex)}, &kind, &version)
 	if !kind.Valid || retainedTypeKind(kind.Int64) != retainedTypeGeneratedCgoSource {
 		t.Fatalf("backfilled retained_type = %v, want %d", kind, retainedTypeGeneratedCgoSource)
 	}
@@ -4761,7 +4766,7 @@ func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	var blobType, retainedType sql.NullInt64
-	if err := st.db.QueryRowContext(ctx, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, actionID).Scan(&blobType, &retainedType); err != nil {
+	if err := st.db.QueryRowContext(ctx, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, idKey(actionID)).Scan(&blobType, &retainedType); err != nil {
 		t.Fatal(err)
 	}
 	if blobType.Valid {
@@ -4781,7 +4786,7 @@ func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
 	if err := st.q.upsertEntry(ctx, changed); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.db.QueryRowContext(ctx, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, actionID).Scan(&blobType, &retainedType); err != nil {
+	if err := st.db.QueryRowContext(ctx, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, idKey(actionID)).Scan(&blobType, &retainedType); err != nil {
 		t.Fatal(err)
 	}
 	if !blobType.Valid || blobTypeKind(blobType.Int64) != blobTypeGoSource {
@@ -4792,69 +4797,64 @@ func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
 	}
 }
 
-func TestMigrateSchemaAddsClassificationColumns(t *testing.T) {
+func TestCatalogSchemaRejectsHexKeys(t *testing.T) {
 	t.Parallel()
 
-	dbPath := filepath.Join(t.TempDir(), "cache.db")
-	db, err := sql.Open("sqlite", "file:"+dbPath)
+	// The catalog stores raw digests, and Go carries them as hex. Binding the hex
+	// by mistake would otherwise store a TEXT value that never compares equal to
+	// the key it stands for, making the row invisible rather than wrong. STRICT is
+	// what makes that a failure instead of a silent one.
+	st, err := newStore(config{dir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close() //nolint:errcheck
+	defer st.close()
 
 	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, `
-CREATE TABLE entries (
-	action_id TEXT PRIMARY KEY,
-	output_id TEXT NOT NULL,
-	size INTEGER NOT NULL,
-	compressed_size INTEGER NOT NULL,
-	created_at INTEGER NOT NULL,
-	accessed_at INTEGER NOT NULL
-);
-CREATE INDEX entries_output_id ON entries(output_id)`); err != nil {
+	actionHex := hexOf(bytes.Repeat([]byte{7}, 32))
+	outputHex := hexOf(bytes.Repeat([]byte{8}, 32))
+	if err := st.q.upsertEntry(ctx, entry{
+		ActionID: actionHex, OutputID: outputHex,
+		Size: 1, CompressedSize: 1, CreatedAt: time.Now(), AccessedAt: time.Now(),
+	}); err != nil {
 		t.Fatal(err)
 	}
 
-	for _, col := range []string{"blob_type", "blob_type_version", "retained_type", "retained_type_version"} {
-		if has, err := entriesHasColumn(ctx, db, col); err != nil {
-			t.Fatal(err)
-		} else if has {
-			t.Fatalf("column %s present before migration", col)
-		}
+	if _, err := st.db.ExecContext(ctx,
+		`UPDATE entries SET output_id = ? WHERE action_id = ?`, outputHex, idKey(actionHex)); err == nil {
+		t.Fatal("stored a hex string in a BLOB key column")
+	}
+	if _, err := st.db.ExecContext(ctx,
+		`INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
+		 VALUES (?, ?, 1, 1, 0, 0)`, actionHex, idKey(outputHex)); err == nil {
+		t.Fatal("inserted a hex string as an action ID")
 	}
 
-	if err := migrateSchema(ctx, db); err != nil {
+	// The round trip still works, so the rejection above is about the type and not
+	// about the statements being wrong.
+	ent, err := st.q.lookupEntry(ctx, actionHex)
+	if err != nil {
 		t.Fatal(err)
 	}
-	// Idempotent: running again must not fail.
-	if err := migrateSchema(ctx, db); err != nil {
+	if ent.OutputID != outputHex {
+		t.Fatalf("output ID = %q, want %q", ent.OutputID, outputHex)
+	}
+}
+
+func TestCatalogSchemaCoversStatusClassifications(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer st.close()
 
-	for _, col := range []string{"blob_type", "blob_type_version", "retained_type", "retained_type_version"} {
-		if has, err := entriesHasColumn(ctx, db, col); err != nil {
-			t.Fatal(err)
-		} else if !has {
-			t.Fatalf("column %s missing after migration", col)
-		}
-	}
-
-	// The plain output_id index is replaced by the covering index.
-	if has, err := indexExists(ctx, db, "entries_output_cover"); err != nil {
+	ctx := context.Background()
+	if has, err := indexExists(ctx, st.db, "entries_output_cover"); err != nil {
 		t.Fatal(err)
 	} else if !has {
-		t.Fatal("entries_output_cover missing after migration")
-	}
-	if current, err := statusCoverIndexCurrent(ctx, db); err != nil {
-		t.Fatal(err)
-	} else if !current {
-		t.Fatal("entries_output_cover does not cover status classifications")
-	}
-	if has, err := indexExists(ctx, db, "entries_output_id"); err != nil {
-		t.Fatal(err)
-	} else if has {
-		t.Fatal("entries_output_id present after migration")
+		t.Fatal("entries_output_cover missing from a fresh catalog")
 	}
 }
 
@@ -5867,7 +5867,7 @@ func readExportData(t *testing.T, path string) []byte {
 
 func retainedPath(cacheDir string, outputID []byte, ext string) string {
 	outputHex := hexOf(outputID)
-	return filepath.Join(cacheDir, "v1", retainedDirName, outputHex[:2], outputHex+ext)
+	return filepath.Join(testVersionDir(cacheDir), retainedDirName, outputHex[:2], outputHex+ext)
 }
 
 // incompressibleBody returns bytes zstd cannot shrink, so a test can reason
@@ -5991,4 +5991,10 @@ func strconvQuote(s string) string {
 		panic(err)
 	}
 	return string(b)
+}
+
+// testVersionDir is where a cache directory's current schema version lives, so
+// tests do not carry a version number that a schema change has to chase.
+func testVersionDir(cacheDir string) string {
+	return cacheVersionDir(config{dir: cacheDir})
 }

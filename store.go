@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,12 +19,32 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const cacheSchemaVersion = 1
+// cacheSchemaVersion names the on-disk layout, and appears in the cache path, so
+// binaries expecting different layouts use different directories and never open
+// each other's catalog. Bumping it therefore starts cold rather than migrating:
+// a build cache refills, and rewriting a multi-GiB catalog in place while six
+// helpers may start at any moment buys nothing.
+const cacheSchemaVersion = 2
 
+// catalogSchema is complete: every version-2 catalog is created from it, so there
+// is no migration path to keep. Adding to it later has to be additive, because
+// the version in the path lets an older binary of the same version open the
+// result; anything else bumps cacheSchemaVersion.
+//
+// IDs are stored as the raw digest rather than the 64-character hex that Go uses
+// for paths. Hex doubles all three copies of every key — the row, the primary-key
+// b-tree, and the covering index — and a production catalog spent 650MiB on the
+// key index alone. WITHOUT ROWID removes that third copy entirely by making the
+// table its own primary-key b-tree.
+//
+// STRICT is what keeps that decision honest. Without it a hex string bound to a
+// BLOB column is stored as TEXT and simply never compares equal to the key it was
+// meant to be, so the row is invisible rather than wrong, and nothing reports a
+// problem. STRICT turns that into "cannot store TEXT value in BLOB column".
 const catalogSchema = `
 CREATE TABLE IF NOT EXISTS entries (
-	action_id TEXT PRIMARY KEY,
-	output_id TEXT NOT NULL,
+	action_id BLOB PRIMARY KEY,
+	output_id BLOB NOT NULL,
 	size INTEGER NOT NULL,
 	compressed_size INTEGER NOT NULL,
 	created_at INTEGER NOT NULL,
@@ -34,15 +53,18 @@ CREATE TABLE IF NOT EXISTS entries (
 	blob_type_version INTEGER,
 	retained_type INTEGER,
 	retained_type_version INTEGER
-);
+) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS entries_accessed_at ON entries(accessed_at);
+CREATE INDEX IF NOT EXISTS entries_output_cover ON entries(
+	output_id, size, compressed_size,
+	blob_type, blob_type_version, retained_type, retained_type_version);
 
 CREATE TABLE IF NOT EXISTS runs (
 	run_id TEXT PRIMARY KEY,
 	path TEXT NOT NULL,
 	lock_path TEXT NOT NULL,
 	created_at INTEGER NOT NULL
-);
+) STRICT;
 `
 
 type entry struct {
@@ -389,83 +411,10 @@ func initDB(db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, catalogSchema); err != nil {
 		return fmt.Errorf("initialize catalog: %w", err)
 	}
-	if err := migrateSchema(ctx, db); err != nil {
-		return err
-	}
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, cacheSchemaVersion)); err != nil {
 		return fmt.Errorf("write catalog version: %w", err)
 	}
 	return nil
-}
-
-// migrateSchema applies in-place schema changes to caches created by earlier
-// versions of gocachez without bumping cacheSchemaVersion, so existing caches
-// keep working after an upgrade.
-func migrateSchema(ctx context.Context, db catalogDB) error {
-	for _, col := range []struct{ name, ddl string }{
-		{"blob_type", "blob_type INTEGER"},
-		{"blob_type_version", "blob_type_version INTEGER"},
-		{"retained_type", "retained_type INTEGER"},
-		{"retained_type_version", "retained_type_version INTEGER"},
-	} {
-		has, err := entriesHasColumn(ctx, db, col.name)
-		if err != nil {
-			return fmt.Errorf("inspect entries schema: %w", err)
-		}
-		if !has {
-			if _, err := db.ExecContext(ctx, "ALTER TABLE entries ADD COLUMN "+col.ddl); err != nil {
-				return fmt.Errorf("add entries.%s column: %w", col.name, err)
-			}
-		}
-	}
-	// Keep the status GROUP BY output_id scan covering as cached classifications
-	// are added to the schema.
-	current, err := statusCoverIndexCurrent(ctx, db)
-	if err != nil {
-		return fmt.Errorf("inspect entries_output_cover index: %w", err)
-	}
-	if !current {
-		if _, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS entries_output_cover`); err != nil {
-			return fmt.Errorf("drop stale entries_output_cover index: %w", err)
-		}
-		if _, err := db.ExecContext(ctx, `CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, blob_type, blob_type_version, retained_type, retained_type_version)`); err != nil {
-			return fmt.Errorf("create entries_output_cover index: %w", err)
-		}
-	}
-	if _, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS entries_output_id`); err != nil {
-		return fmt.Errorf("drop entries_output_id index: %w", err)
-	}
-	return nil
-}
-
-func statusCoverIndexCurrent(ctx context.Context, db catalogDB) (bool, error) {
-	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_index_info('entries_output_cover') ORDER BY seqno`)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close() //nolint:errcheck
-
-	want := []string{
-		"output_id",
-		"size",
-		"compressed_size",
-		"blob_type",
-		"blob_type_version",
-		"retained_type",
-		"retained_type_version",
-	}
-	var got []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return false, err
-		}
-		got = append(got, name)
-	}
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-	return slices.Equal(got, want), nil
 }
 
 func (st *store) close() {

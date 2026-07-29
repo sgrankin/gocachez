@@ -247,15 +247,7 @@ func readCatalogStatus(dbPath string, withTypes bool) (bool, catalogStatus, []ca
 
 	var outputs []catalogOutput
 	if withTypes {
-		hasBlobType, err := entriesHasColumn(ctx, db, "blob_type_version")
-		if err != nil {
-			return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
-		}
-		hasRetainedType, err := entriesHasColumn(ctx, db, "retained_type_version")
-		if err != nil {
-			return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
-		}
-		outputs, err = q.listOutputs(ctx, hasBlobType, blobClassifierVersion, hasRetainedType, retainedClassifierVersion)
+		outputs, err = q.listOutputs(ctx)
 		if err != nil {
 			return false, catalogStatus{}, nil, fmt.Errorf("list catalog outputs: %w", err)
 		}

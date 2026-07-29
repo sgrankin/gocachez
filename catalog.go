@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -14,11 +15,27 @@ type catalogDB interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// idKey converts one of the hex IDs that Go passes around into the raw digest the
+// catalog stores. Every such string was produced by hex-encoding bytes we already
+// held — from the protocol, or read back out of a BLOB column — so a decode
+// failure is a broken invariant in this program rather than bad input, and there
+// is no value it could return that would not corrupt the catalog.
+func idKey(hexID string) []byte {
+	key, err := hex.DecodeString(hexID)
+	if err != nil {
+		panic(fmt.Sprintf("catalog: %q is not a hex ID: %v", hexID, err))
+	}
+	return key
+}
+
 // lookupEntrySQL and upsertEntrySQL are the per-request hot-path queries. They
 // are prepared once on the store's connection (see catalog.prepare) so modernc
 // does not re-parse them on every get/put.
+//
+// action_id is deliberately absent from the select list: the caller passed it in,
+// so reading it back is a column of copying per cache hit to learn nothing.
 const lookupEntrySQL = `
-SELECT action_id, output_id, size, compressed_size, created_at, accessed_at
+SELECT output_id, size, compressed_size, created_at, accessed_at
 FROM entries
 WHERE action_id = ?`
 
@@ -144,8 +161,8 @@ WHERE run_id = ?`, runID)
 
 func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
 	args := []any{
-		ent.ActionID,
-		ent.OutputID,
+		idKey(ent.ActionID),
+		idKey(ent.OutputID),
 		ent.Size,
 		ent.CompressedSize,
 		unixMillis(ent.CreatedAt),
@@ -161,17 +178,18 @@ func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
 }
 
 func (c *catalog) lookupEntry(ctx context.Context, actionID string) (entry, error) {
+	key := idKey(actionID)
 	var row *sql.Row
 	if c.lookupStmt != nil {
-		row = c.lookupStmt.QueryRowContext(ctx, actionID)
+		row = c.lookupStmt.QueryRowContext(ctx, key)
 	} else {
-		row = c.db.QueryRowContext(ctx, lookupEntrySQL, actionID)
+		row = c.db.QueryRowContext(ctx, lookupEntrySQL, key)
 	}
-	var ent entry
+	ent := entry{ActionID: actionID}
+	var outputID []byte
 	var createdAt, accessedAt int64
 	err := row.Scan(
-		&ent.ActionID,
-		&ent.OutputID,
+		&outputID,
 		&ent.Size,
 		&ent.CompressedSize,
 		&createdAt,
@@ -180,6 +198,7 @@ func (c *catalog) lookupEntry(ctx context.Context, actionID string) (entry, erro
 	if err != nil {
 		return entry{}, err
 	}
+	ent.OutputID = hex.EncodeToString(outputID)
 	ent.CreatedAt = millisTime(createdAt)
 	ent.AccessedAt = millisTime(accessedAt)
 	return ent, nil
@@ -190,7 +209,7 @@ func (c *catalog) lookupEntry(ctx context.Context, actionID string) (entry, erro
 func (c *catalog) touchEntries(ctx context.Context, tx *sql.Tx, accessed map[string]int64) error {
 	if c.touchStmt == nil {
 		for actionID, accessedAt := range accessed {
-			if _, err := tx.ExecContext(ctx, touchEntrySQL, accessedAt, actionID); err != nil {
+			if _, err := tx.ExecContext(ctx, touchEntrySQL, accessedAt, idKey(actionID)); err != nil {
 				return fmt.Errorf("touch entry: %w", err)
 			}
 		}
@@ -199,7 +218,7 @@ func (c *catalog) touchEntries(ctx context.Context, tx *sql.Tx, accessed map[str
 	stmt := tx.StmtContext(ctx, c.touchStmt)
 	defer stmt.Close() //nolint:errcheck
 	for actionID, accessedAt := range accessed {
-		if _, err := stmt.ExecContext(ctx, accessedAt, actionID); err != nil {
+		if _, err := stmt.ExecContext(ctx, accessedAt, idKey(actionID)); err != nil {
 			return fmt.Errorf("touch entry: %w", err)
 		}
 	}
@@ -212,7 +231,7 @@ func (c *catalog) touchEntries(ctx context.Context, tx *sql.Tx, accessed map[str
 func (c *catalog) deleteEntriesByOutputID(ctx context.Context, outputID string) error {
 	_, err := c.db.ExecContext(ctx, `
 DELETE FROM entries
-WHERE output_id = ?`, outputID)
+WHERE output_id = ?`, idKey(outputID))
 	return err
 }
 
@@ -232,7 +251,7 @@ WHERE output_id = ?
   AND NOT EXISTS (
     SELECT 1 FROM entries newer
     WHERE newer.output_id = ? AND newer.accessed_at > ?
-  )`, outputID, outputID, accessedAt)
+  )`, idKey(outputID), idKey(outputID), accessedAt)
 	if err != nil {
 		return 0, err
 	}
@@ -273,11 +292,6 @@ FROM (
 	return size, err
 }
 
-// listOutputs returns one row per output with its uncompressed and compressed
-// size. When includeBlobType is set it also returns the cached blob
-// classification (blobType), but only for entries classified at
-// classifierVersion; classifications from older versions are treated as absent
-// so they get recomputed. blobType is only available on migrated caches.
 // outputStats totals what status reports without materialising a row per output.
 // It mirrors listOutputs' grouping — one row per output_id, taking MAX of each
 // size — because several actions can map to one output and its bytes are on disk
@@ -296,24 +310,19 @@ FROM (
 	return count, size, compressedSize, err
 }
 
-func (c *catalog) listOutputs(
-	ctx context.Context,
-	includeBlobType bool,
-	blobClassifierVersion int64,
-	includeRetainedType bool,
-	retainedClassifierVersion int64,
-) ([]catalogOutput, error) {
-	columns := "output_id, CAST(MAX(size) AS INTEGER), CAST(MAX(compressed_size) AS INTEGER)"
-	args := []any(nil)
-	if includeBlobType {
-		columns += ", MAX(CASE WHEN blob_type_version = ? THEN blob_type END)"
-		args = append(args, blobClassifierVersion)
-	}
-	if includeRetainedType {
-		columns += ", MAX(CASE WHEN retained_type_version = ? THEN retained_type END)"
-		args = append(args, retainedClassifierVersion)
-	}
-	rows, err := c.db.QueryContext(ctx, "SELECT "+columns+" FROM entries GROUP BY output_id", args...)
+// listOutputs returns one row per output with its uncompressed and compressed
+// size and its cached classifications. A classification stamped by an older
+// classifier is reported as absent, so status recomputes it rather than
+// reporting a stale answer.
+func (c *catalog) listOutputs(ctx context.Context) ([]catalogOutput, error) {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT output_id,
+       CAST(MAX(size) AS INTEGER),
+       CAST(MAX(compressed_size) AS INTEGER),
+       MAX(CASE WHEN blob_type_version = ? THEN blob_type END),
+       MAX(CASE WHEN retained_type_version = ? THEN retained_type END)
+FROM entries
+GROUP BY output_id`, blobClassifierVersion, retainedClassifierVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -322,16 +331,12 @@ func (c *catalog) listOutputs(
 	var outputs []catalogOutput
 	for rows.Next() {
 		var output catalogOutput
-		dest := []any{&output.outputID, &output.size, &output.compressedSize}
-		if includeBlobType {
-			dest = append(dest, &output.blobType)
-		}
-		if includeRetainedType {
-			dest = append(dest, &output.retainedType)
-		}
-		if err := rows.Scan(dest...); err != nil {
+		var outputID []byte
+		if err := rows.Scan(&outputID, &output.size, &output.compressedSize,
+			&output.blobType, &output.retainedType); err != nil {
 			return nil, err
 		}
+		output.outputID = hex.EncodeToString(outputID)
 		outputs = append(outputs, output)
 	}
 	if err := rows.Err(); err != nil {
@@ -340,11 +345,31 @@ func (c *catalog) listOutputs(
 	return outputs, nil
 }
 
-func (c *catalog) referencedOutputIDs(ctx context.Context, lower, upper string, minAccessedAt int64, outputIDs map[string]struct{}) error {
-	rows, err := c.db.QueryContext(ctx, `
+const referencedOutputsSQL = `
 SELECT DISTINCT output_id
 FROM entries
-WHERE output_id >= ? AND output_id < ? AND accessed_at >= ?`, lower, upper, minAccessedAt)
+WHERE output_id >= ? AND output_id < ? AND accessed_at >= ?`
+
+// The last shard has no successor byte to stop before. BLOBs compare by content
+// with the shorter one first, so every key beginning 0xff sorts at or above the
+// single byte 0xff, and no other key does.
+const referencedOutputsTailSQL = `
+SELECT DISTINCT output_id
+FROM entries
+WHERE output_id >= ? AND accessed_at >= ?`
+
+// referencedOutputIDs replaces outputIDs with the outputs referenced by entries
+// whose ID starts with the shard byte. Entries accessed before minAccessedAt are
+// ignored, which lets a scan plan around the entries it is about to delete; pass
+// keepEveryEntry to count all of them.
+func (c *catalog) referencedOutputIDs(ctx context.Context, shard int, minAccessedAt int64, outputIDs map[string]struct{}) error {
+	query, args := referencedOutputsSQL, []any{
+		[]byte{byte(shard)}, []byte{byte(shard + 1)}, minAccessedAt,
+	}
+	if shard == lastOutputShard {
+		query, args = referencedOutputsTailSQL, []any{[]byte{byte(shard)}, minAccessedAt}
+	}
+	rows, err := c.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -352,11 +377,11 @@ WHERE output_id >= ? AND output_id < ? AND accessed_at >= ?`, lower, upper, minA
 
 	clear(outputIDs)
 	for rows.Next() {
-		var outputID string
+		var outputID []byte
 		if err := rows.Scan(&outputID); err != nil {
 			return err
 		}
-		outputIDs[outputID] = struct{}{}
+		outputIDs[hex.EncodeToString(outputID)] = struct{}{}
 	}
 	return rows.Err()
 }
@@ -372,12 +397,12 @@ SET retained_type = ?, retained_type_version = ?
 WHERE output_id = ?`
 
 func (c *catalog) updateBlobType(ctx context.Context, outputID string, kind blobTypeKind, classifierVersion int64) error {
-	_, err := c.db.ExecContext(ctx, updateBlobTypeSQL, int64(kind), classifierVersion, outputID)
+	_, err := c.db.ExecContext(ctx, updateBlobTypeSQL, int64(kind), classifierVersion, idKey(outputID))
 	return err
 }
 
 func (c *catalog) updateRetainedType(ctx context.Context, outputID string, kind retainedTypeKind) error {
-	_, err := c.db.ExecContext(ctx, updateRetainedTypeSQL, int64(kind), retainedClassifierVersion, outputID)
+	_, err := c.db.ExecContext(ctx, updateRetainedTypeSQL, int64(kind), retainedClassifierVersion, idKey(outputID))
 	return err
 }
 
@@ -461,7 +486,7 @@ func commitClassifications[K ~int](ctx context.Context, db *sql.DB, stmt *sql.St
 	txStmt := tx.StmtContext(ctx, stmt)
 	defer txStmt.Close() //nolint:errcheck
 	for outputID, kind := range batch {
-		if _, err := txStmt.ExecContext(ctx, int64(kind), version, outputID); err != nil {
+		if _, err := txStmt.ExecContext(ctx, int64(kind), version, idKey(outputID)); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("cache classification: %w", err)
 		}
@@ -470,25 +495,6 @@ func commitClassifications[K ~int](ctx context.Context, db *sql.DB, stmt *sql.St
 		return fmt.Errorf("commit classifications: %w", err)
 	}
 	return nil
-}
-
-func entriesHasColumn(ctx context.Context, db catalogDB, column string) (bool, error) {
-	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_table_info('entries')`)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close() //nolint:errcheck
-
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return false, err
-		}
-		if name == column {
-			return true, nil
-		}
-	}
-	return false, rows.Err()
 }
 
 // oldestAccessWatermark reports the access time of the limit'th entry at or
@@ -535,9 +541,11 @@ ORDER BY MAX(accessed_at)`, from, watermark, watermark)
 	var candidates []pruneCandidate
 	for rows.Next() {
 		var candidate pruneCandidate
-		if err := rows.Scan(&candidate.outputID, &candidate.size, &candidate.accessedAt); err != nil {
+		var outputID []byte
+		if err := rows.Scan(&outputID, &candidate.size, &candidate.accessedAt); err != nil {
 			return nil, err
 		}
+		candidate.outputID = hex.EncodeToString(outputID)
 		candidates = append(candidates, candidate)
 	}
 	if err := rows.Err(); err != nil {
