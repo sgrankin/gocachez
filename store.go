@@ -226,6 +226,16 @@ func sweepStampPath(versionDir string) string {
 	return filepath.Join(versionDir, "sweep.stamp")
 }
 
+// retainedStampPath names the file whose mtime records the last completed expiry of
+// retained go list files. That pass is the only one that still needs an idle cache, and
+// a stamp of its own is what stops a skip costing it an hour: it is written when the
+// pass runs, not when it is attempted, so a cache that was busy is retried by the next
+// close rather than at the next interval. Sampling hourly for an idle moment on a host
+// that is busy almost always is how retained files would come to never expire.
+func retainedStampPath(versionDir string) string {
+	return filepath.Join(versionDir, "retained.stamp")
+}
+
 const runDirPrefix = "run-"
 
 // runLockName is the file a run holds a lock on for as long as it is using the

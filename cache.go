@@ -642,7 +642,8 @@ func (st *store) prune() error {
 	// Check the stamps before anything else: skipping is the common case.
 	now := time.Now()
 	sweepDue, pruneDue := st.sweepDue(now), st.pruneDue(now)
-	if !sweepDue && !pruneDue {
+	retainedDue := st.retainedExpiryDue(now)
+	if !sweepDue && !pruneDue && !retainedDue {
 		return nil
 	}
 	// Serialise maintenance on a lock of its own. Analysis is expensive and its
@@ -655,6 +656,14 @@ func (st *store) prune() error {
 				return err
 			}
 			if err := st.markSwept(); err != nil {
+				return err
+			}
+		}
+		// Before the gated scan and on its own stamp, so a cache that was busy at the
+		// last attempt is retried now rather than at the next interval. Costs two lock
+		// attempts and a count when it cannot proceed.
+		if retainedDue {
+			if err := st.expireRetainedWhenIdle(now); err != nil {
 				return err
 			}
 		}
@@ -738,7 +747,11 @@ func (st *store) markSwept() error {
 // maintenance lock is taken and again inside applyPrune, and an absent stamp
 // reads as due in both places.
 func clearMaintenanceStamps(versionDir string) error {
-	for _, path := range []string{pruneStampPath(versionDir), sweepStampPath(versionDir)} {
+	for _, path := range []string{
+		pruneStampPath(versionDir),
+		sweepStampPath(versionDir),
+		retainedStampPath(versionDir),
+	} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("clear maintenance stamp: %w", err)
 		}
@@ -769,6 +782,22 @@ func (st *store) pruneDue(now time.Time) bool {
 	return age >= pruneInterval || age < 0
 }
 
+func (st *store) retainedExpiryDue(now time.Time) bool {
+	info, err := os.Stat(retainedStampPath(st.versionDir))
+	if err != nil {
+		return true
+	}
+	age := now.Sub(info.ModTime())
+	return age >= pruneInterval || age < 0
+}
+
+func (st *store) markRetainedExpired() error {
+	if err := os.WriteFile(retainedStampPath(st.versionDir), nil, 0o666); err != nil {
+		return fmt.Errorf("write retained-expiry stamp: %w", err)
+	}
+	return nil
+}
+
 func (st *store) markPruned() error {
 	if err := os.WriteFile(pruneStampPath(st.versionDir), nil, 0o666); err != nil {
 		return fmt.Errorf("write prune stamp: %w", err)
@@ -797,29 +826,20 @@ func (st *store) markPruned() error {
 //     matter — a put writes its blob before inserting the row, so a blob can be
 //     unreferenced during the walk and referenced by the time we delete.
 type prunePlan struct {
-	// retainedCutoff is the age boundary the retained groups were built against.
-	// Deletion re-reads mtimes but compares them to this, so the re-check can
-	// only ever keep more than the plan chose, never less.
-	retainedCutoff time.Time
 	// entryCutoff is where eviction starts looking. Anything older is the age
 	// pass's to remove, so listing it for eviction as well is wasted work. It is
 	// not itself applied here — sweepUnlocked does that, without the idle gate.
 	entryCutoff int64
-	retained    []string         // expired retained files
 	blobs       []pruneCandidate // over-budget blobs, least recently used first
 }
 
 func (p prunePlan) empty() bool {
-	return len(p.retained) == 0 && len(p.blobs) == 0
+	return len(p.blobs) == 0
 }
 
 func (st *store) planPrune(now time.Time) (prunePlan, error) {
-	plan := prunePlan{retainedCutoff: trimCutoff(st.retainedAge(), now)}
-	plan.entryCutoff = st.planOldEntries(now)
+	plan := prunePlan{entryCutoff: st.planOldEntries(now)}
 	var err error
-	if plan.retained, err = st.planOldRetainedFiles(now); err != nil {
-		return prunePlan{}, err
-	}
 	if plan.blobs, err = st.planToMaxSize(plan.entryCutoff); err != nil {
 		return prunePlan{}, err
 	}
@@ -842,14 +862,6 @@ func (st *store) applyPrune(plan prunePlan) error {
 	if err != nil {
 		return err
 	}
-	// Retained files are a different matter. A path printed by go list is handed to
-	// tooling that may hold it for as long as a job runs, and nothing about the file
-	// says whether anyone does; only the absence of builds does. So this half still
-	// waits, and a busy cache defers it exactly as it always has. Attempted even with
-	// nothing planned, because reclaiming dead runs rides on the same lock.
-	if err := st.expireRetainedWhenIdle(plan); err != nil {
-		return err
-	}
 	// An evicted output has no inventory row left, so its retained files are
 	// unreferenced too, and nothing else in this pass would have looked at them.
 	// removeOrphans re-checks the shard, so anything referenced again is kept.
@@ -858,17 +870,20 @@ func (st *store) applyPrune(plan prunePlan) error {
 	if err := st.removeOrphans(retained, time.Now().Add(-orphanGrace)); err != nil {
 		return err
 	}
-	if err := st.markPruned(); err != nil {
-		return err
-	}
-	st.checkpointWAL()
-	return nil
+	return st.markPruned()
 }
 
-// expireRetainedWhenIdle removes retained files past their age, but only with no build
-// registered. Reclaiming the directories of runs that are gone rides along, because it
-// needs the same lock: a starting store takes it too.
-func (st *store) expireRetainedWhenIdle(plan prunePlan) error {
+// expireRetainedWhenIdle removes retained files past their age, and is the only pass
+// that still needs the cache idle. A path printed by go list is handed to tooling that
+// may hold it for as long as a job runs, and nothing about the file says whether anyone
+// does; only the absence of builds does. Because a closing store keeps its run
+// registered until its retained files are adopted, no build is part way through claiming
+// one when this finds the count at zero.
+//
+// The walk happens after the idle check, not before, so an attempt that cannot proceed
+// costs two lock attempts and a count. Reclaiming the directories of runs that are gone
+// rides along, because it needs the same lock: a starting store takes it too.
+func (st *store) expireRetainedWhenIdle(now time.Time) error {
 	applied, err := withFileLockIfFree(st.lifecycleLockPath, func() error {
 		if err := st.cleanupAbandonedRuns(); err != nil {
 			log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
@@ -878,9 +893,20 @@ func (st *store) expireRetainedWhenIdle(plan prunePlan) error {
 			return fmt.Errorf("count active runs: %w", err)
 		}
 		if active > 0 {
+			// Deliberately not stamped, so the next close tries again.
 			return nil
 		}
-		return st.removeExpiredRetainedFiles(plan.retained, plan.retainedCutoff)
+		expired, err := st.planOldRetainedFiles(now)
+		if err != nil {
+			return err
+		}
+		if err := st.removeExpiredRetainedFiles(expired, trimCutoff(st.retainedAge(), now)); err != nil {
+			return err
+		}
+		// Truncating the log wants no other readers, and this is the only place that
+		// has established there are none.
+		st.checkpointWAL()
+		return st.markRetainedExpired()
 	})
 	if err == nil && !applied && st.verbose {
 		log.Print("gocachez: skipped retained-file expiry, another process holds the cache lock")

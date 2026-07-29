@@ -2869,7 +2869,7 @@ func TestPruneKeepsOrphanThatGainedAnEntryAfterPlanning(t *testing.T) {
 	}
 }
 
-func TestPruneKeepsRetainedFileRefreshedAfterPlanning(t *testing.T) {
+func TestRetainedExpiryKeepsAFileRefreshedAfterTheWalk(t *testing.T) {
 	t.Parallel()
 
 	cacheDir := t.TempDir()
@@ -2904,28 +2904,26 @@ func TestPruneKeepsRetainedFileRefreshedAfterPlanning(t *testing.T) {
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
-	plan, err := st.planPrune(time.Now())
+	now := time.Now()
+	expired, err := st.planOldRetainedFiles(now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.retained) == 0 {
-		t.Fatal("planPrune did not see the expired retained file")
+	if len(expired) == 0 {
+		t.Fatal("the walk did not see the expired retained file")
 	}
 
-	// A build that ran while the scan was planning would have refreshed this
-	// via markRetainedFileUsed, which is the whole point of the mtime.
+	// A build that ran between the walk and the removal would have refreshed this via
+	// markRetainedFileUsed, which is the whole point of the mtime.
 	fresh := time.Now()
 	if err := os.Chtimes(exportPath, fresh, fresh); err != nil {
 		t.Fatal(err)
 	}
-	// The first close already stamped; without this applyPrune declines and the
-	// file survives for the wrong reason.
-	expireMaintenanceStamps(t, st.versionDir)
-	if err := st.applyPrune(plan); err != nil {
+	if err := st.removeExpiredRetainedFiles(expired, trimCutoff(st.retainedAge(), now)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(exportPath); err != nil {
-		t.Fatalf("retained file refreshed after planning was deleted anyway: %v", err)
+		t.Fatalf("retained file refreshed after the walk was deleted anyway: %v", err)
 	}
 }
 
@@ -5981,7 +5979,11 @@ func prunePromptly(t *testing.T, st *store) {
 func expireMaintenanceStamps(t *testing.T, versionDir string) {
 	t.Helper()
 	old := time.Now().Add(-2 * pruneInterval)
-	for _, path := range []string{pruneStampPath(versionDir), sweepStampPath(versionDir)} {
+	for _, path := range []string{
+		pruneStampPath(versionDir),
+		sweepStampPath(versionDir),
+		retainedStampPath(versionDir),
+	} {
 		if err := os.Chtimes(path, old, old); err != nil && !os.IsNotExist(err) {
 			t.Fatal(err)
 		}
@@ -7130,5 +7132,69 @@ func TestEvictionPagesThroughTiedAccessTimes(t *testing.T) {
 			t.Fatalf("candidate %s planned twice", candidate.outputID)
 		}
 		seen[candidate.outputID] = struct{}{}
+	}
+}
+
+// Retained-file expiry is the one pass that still needs an idle cache, so on a host that
+// is busy almost always it will usually find builds registered. If a skipped attempt
+// stamped, the next one would be an hour away, and sampling for an idle moment once an
+// hour is how retained files come to never expire at all.
+func TestRetainedExpiryRetriesAfterABusyCacheRatherThanWaitingAnHour(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir, maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputID := bytes.Repeat([]byte{97}, 32)
+	body := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 64))
+	if _, err := st.put(request{
+		ID: 1, Command: cmdPut, ActionID: bytes.Repeat([]byte{98}, 32),
+		OutputID: outputID, BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	exportPath := retainedPath(cacheDir, outputID, ".a")
+	old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
+	if err := os.Chtimes(exportPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// The close above found the cache idle and stamped. Age it, so what is measured
+	// below is what the skipped attempt does rather than what that one already did.
+	expireMaintenanceStamps(t, testVersionDir(cacheDir))
+
+	st, err = newStore(config{dir: cacheDir, maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	// This store's own run is registered, so the cache is in use.
+	if err := st.expireRetainedWhenIdle(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(exportPath); err != nil {
+		t.Fatalf("expired a retained file while a build was registered: %v", err)
+	}
+	if !st.retainedExpiryDue(time.Now()) {
+		t.Fatal("a skipped attempt stamped itself, so the retry waits out the interval")
+	}
+
+	// The cache falls idle moments later, which the retry must catch.
+	if _, err := st.db.ExecContext(context.Background(),
+		`DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.expireRetainedWhenIdle(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(exportPath); !os.IsNotExist(err) {
+		t.Errorf("retained export stat err = %v, want not exist", err)
+	}
+	if st.retainedExpiryDue(time.Now()) {
+		t.Error("a pass that ran did not stamp, so it will repeat on every close")
 	}
 }
