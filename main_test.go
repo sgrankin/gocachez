@@ -6994,3 +6994,83 @@ func TestAnUnreadableShardDoesNotDiscardTheRetainedRun(t *testing.T) {
 		t.Errorf("the retained live path is gone: %v", err)
 	}
 }
+
+// Age expiry picks its keys in one statement and deletes them in another, and it runs
+// against live builds. A row read and flushed in between must survive: deleting it by
+// key alone would take an entry that is in use, and for an output would send the blob
+// after it on the next orphan pass.
+func TestAgeExpirySparesARowRefreshedAfterItWasChosen(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	ctx := context.Background()
+	stale := time.Now().Add(-90 * 24 * time.Hour)
+	kept := bytes.Repeat([]byte{71}, 32)
+	doomed := bytes.Repeat([]byte{72}, 32)
+	for i, actionID := range [][]byte{kept, doomed} {
+		body := []byte("body")
+		if _, err := st.put(request{
+			ID: int64(i), Command: cmdPut, ActionID: actionID,
+			OutputID: bytes.Repeat([]byte{byte(73 + i)}, 32), BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE entries SET accessed_at = ?`, unixMillis(stale)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE outputs SET accessed_at = ?`, unixMillis(stale)); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := unixMillis(time.Now().Add(-24 * time.Hour))
+	actions, err := st.q.staleActionIDs(ctx, cutoff, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 2 {
+		t.Fatalf("selected %d stale entries, want 2", len(actions))
+	}
+	outputs, err := st.q.staleOutputIDs(ctx, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A build reads one of them, and its access flush lands, after the keys were chosen.
+	fresh := unixMillis(time.Now())
+	if _, err := st.db.ExecContext(ctx,
+		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`, fresh, idKey(hexOf(kept))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE outputs SET accessed_at = ? WHERE id = 1`, fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same helper the reaper uses, so the guard being present is not this test's
+	// assumption to make.
+	if _, err := deleteStaleByKey(ctx, st.db, "entries", "action_id", cutoff, actions); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deleteStaleByKey(ctx, st.db, "outputs", "output_id", cutoff, outputs); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.lookupEntry(hexOf(kept)); err != nil {
+		t.Errorf("expiry took an entry that was read after it was chosen: %v", err)
+	}
+	if _, err := st.lookupEntry(hexOf(doomed)); !errorsIs(err, sql.ErrNoRows) {
+		t.Errorf("the stale entry survived: %v", err)
+	}
+	var outputsLeft int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM outputs`).Scan(&outputsLeft); err != nil {
+		t.Fatal(err)
+	}
+	if outputsLeft != 1 {
+		t.Errorf("outputs left = %d, want the refreshed one to survive alone", outputsLeft)
+	}
+}

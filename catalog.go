@@ -413,7 +413,7 @@ func (c *catalog) deleteStaleEntries(ctx context.Context, cutoff int64) (int64, 
 		if len(ids) == 0 {
 			return total, nil
 		}
-		removed, err := deleteByKey(ctx, c.db, `DELETE FROM entries WHERE action_id = ?`, ids)
+		removed, err := deleteStaleByKey(ctx, c.db, "entries", "action_id", cutoff, ids)
 		total += removed
 		if err != nil {
 			return total, err
@@ -451,7 +451,7 @@ func (c *catalog) deleteStaleOutputs(ctx context.Context, cutoff int64) (int64, 
 		if len(ids) == 0 {
 			return total, nil
 		}
-		removed, err := deleteByKey(ctx, c.db, `DELETE FROM outputs WHERE output_id = ?`, ids)
+		removed, err := deleteStaleByKey(ctx, c.db, "outputs", "output_id", cutoff, ids)
 		total += removed
 		if err != nil {
 			return total, err
@@ -481,11 +481,20 @@ func scanKeys(rows *sql.Rows) ([][]byte, error) {
 	return keys, rows.Err()
 }
 
-// deleteByKey removes one batch in one transaction, by primary key, through a single
-// prepared statement — the same shape as commitClassifications and for the same
+// deleteStaleByKey removes one batch in one transaction, by primary key, through a
+// single prepared statement — the same shape as commitClassifications and for the same
 // reason: the point is to bound how long the write lock is held, not to issue the
 // fewest statements.
-func deleteByKey(ctx context.Context, db catalogDB, query string, keys [][]byte) (int64, error) {
+//
+// It builds the statement rather than taking one, so the cutoff cannot be left out. The
+// keys were chosen by an earlier statement and expiry runs against live builds, so a row
+// can be read and its access flushed in between; deleting it by key alone would take an
+// entry that is in use, and for an output would send the blob after it on the next
+// orphan pass. Re-asserting is also what keeps the cursorless outputs loop terminating —
+// a row that survives because it was refreshed is no longer stale, so the next batch
+// does not return it. Table and column are internal constants, never input.
+func deleteStaleByKey(ctx context.Context, db catalogDB, table, keyColumn string, cutoff int64, keys [][]byte) (int64, error) {
+	query := fmt.Sprintf(`DELETE FROM %s WHERE %s = ? AND accessed_at < ?`, table, keyColumn)
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("begin age-expiry transaction: %w", err)
@@ -498,7 +507,7 @@ func deleteByKey(ctx context.Context, db catalogDB, query string, keys [][]byte)
 	defer stmt.Close() //nolint:errcheck
 	var removed int64
 	for _, key := range keys {
-		res, err := stmt.ExecContext(ctx, key)
+		res, err := stmt.ExecContext(ctx, key, cutoff)
 		if err != nil {
 			_ = tx.Rollback()
 			return 0, fmt.Errorf("age-expiry delete: %w", err)
