@@ -735,24 +735,28 @@ func commitClassifications[K ~int](ctx context.Context, db *sql.DB, stmt *sql.St
 	return nil
 }
 
-// evictionCandidates returns the coldest inventoried outputs accessed at or after
-// from, least recently used first, at most limit of them.
+// evictionCandidates returns the coldest inventoried outputs after the given cursor,
+// least recently used first, at most limit of them.
 //
 // This is a range scan of outputs_accessed_at. It replaced a loop that walked
 // entries in bounded steps, taking a GROUP BY and a sort per step, because there
 // is no longer a set of aliases to collapse before the oldest output can be named.
 //
-// Outputs sharing the last row's access time may be left for the next page and so
-// missed by this pass. That only ever yields fewer candidates than ideal, which
-// evictToMaxSize already tolerates — it re-reads the real total and stops at the
-// budget either way.
-func (c *catalog) evictionCandidates(ctx context.Context, from int64, limit int) ([]pruneCandidate, error) {
+// The cursor is the whole of that index — (accessed_at, compressed_size) plus the rowid
+// SQLite appends to every index — because paging on accessed_at alone cannot resume
+// inside a group that shares one. A page that ended mid-group had to either re-read it
+// forever or step past it, and stepping past silently dropped every candidate it had not
+// returned. That is not rare: the access flush stamps a whole batch with one millisecond,
+// so thousands of outputs can share a timestamp, and skipping them leaves the cache over
+// budget with the pass reporting itself done. Ordering by the full index keeps the seek
+// and the limit index-driven, with no sort — see TestEvictionPagesThroughTiedAccessTimes.
+func (c *catalog) evictionCandidates(ctx context.Context, after evictionCursor, limit int) ([]pruneCandidate, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT output_id, compressed_size, accessed_at
+SELECT output_id, compressed_size, accessed_at, id
 FROM outputs
-WHERE accessed_at >= ?
-ORDER BY accessed_at
-LIMIT ?`, from, limit)
+WHERE (accessed_at, compressed_size, id) > (?, ?, ?)
+ORDER BY accessed_at, compressed_size, id
+LIMIT ?`, after.accessedAt, after.size, after.id, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -762,7 +766,7 @@ LIMIT ?`, from, limit)
 	for rows.Next() {
 		var candidate pruneCandidate
 		var outputID []byte
-		if err := rows.Scan(&outputID, &candidate.size, &candidate.accessedAt); err != nil {
+		if err := rows.Scan(&outputID, &candidate.size, &candidate.accessedAt, &candidate.id); err != nil {
 			return nil, err
 		}
 		candidate.outputID = hex.EncodeToString(outputID)

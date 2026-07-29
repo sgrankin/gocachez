@@ -911,7 +911,9 @@ func (st *store) planToMaxSize(entryCutoff int64) ([]pruneCandidate, error) {
 	// listing it for eviction is wasted work. need is therefore an
 	// overestimate, since the age delete frees bytes this does not count.
 	ctx := context.Background()
-	cursor := entryCutoff
+	// Nothing sorts below a zero-size row at the cutoff, so this starts at the cutoff
+	// and takes everything from there.
+	cursor := evictionCursor{accessedAt: entryCutoff, size: -1, id: -1}
 	need := total - st.maxSize
 	var candidates []pruneCandidate
 	for need > 0 {
@@ -929,9 +931,8 @@ func (st *store) planToMaxSize(entryCutoff int64) ([]pruneCandidate, error) {
 				break
 			}
 		}
-		// Past the last row taken, so the next page makes progress rather than
-		// re-reading this one.
-		cursor = batch[len(batch)-1].accessedAt + 1
+		last := batch[len(batch)-1]
+		cursor = evictionCursor{accessedAt: last.accessedAt, size: last.size, id: last.id}
 	}
 	return candidates, nil
 }
@@ -1127,9 +1128,20 @@ func (st *store) checkpointWAL() {
 // and pruneDue already anticipates a skewed clock.
 const keepEveryOutput = math.MinInt64
 
+// evictionCursor is a position in outputs_accessed_at: one page resumes where the last
+// ended. It is the full index key, so it is a total order and no row can fall between
+// two pages.
+type evictionCursor struct {
+	accessedAt int64
+	size       int64
+	id         int64
+}
+
 type pruneCandidate struct {
 	outputID string
-	size     int64
+	// id is the interned row, carried only so a page can resume past this candidate.
+	id   int64
+	size int64
 	// accessedAt is the output's most recent access when it was chosen. Deletion
 	// re-asserts it, so a build that read this output during the planning walk
 	// keeps it.

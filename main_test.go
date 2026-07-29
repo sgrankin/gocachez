@@ -3120,7 +3120,7 @@ func TestCatalogQueriesRespectCanceledContext(t *testing.T) {
 	if _, err := st.q.listOtherRuns(ctx, st.runID); err == nil {
 		t.Fatal("listOtherRuns succeeded with canceled context")
 	}
-	if _, err := st.q.evictionCandidates(ctx, 0, 1); err == nil {
+	if _, err := st.q.evictionCandidates(ctx, evictionCursor{}, 1); err == nil {
 		t.Fatal("evictionCandidates succeeded with canceled context")
 	}
 	if err := st.q.referencedOutputIDs(ctx, 0, keepEveryOutput, make(map[string]struct{})); err == nil {
@@ -3174,7 +3174,7 @@ func TestEvictionStepStaysBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	candidates, err := st.q.evictionCandidates(ctx, 0, evictionSampleSize)
+	candidates, err := st.q.evictionCandidates(ctx, evictionCursor{size: -1, id: -1}, evictionSampleSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7072,5 +7072,63 @@ func TestAgeExpirySparesARowRefreshedAfterItWasChosen(t *testing.T) {
 	}
 	if outputsLeft != 1 {
 		t.Errorf("outputs left = %d, want the refreshed one to survive alone", outputsLeft)
+	}
+}
+
+// The access flush stamps a whole batch with one millisecond, so thousands of outputs
+// can share an access time. Paging on that time alone cannot resume inside such a group:
+// the old cursor stepped past it and silently dropped every candidate it had not yet
+// returned, leaving the cache over budget while the pass reported itself finished.
+func TestEvictionPagesThroughTiedAccessTimes(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	// Every row shares an access time and a size, so only the interned id separates
+	// them — the hardest version of the tie the cursor has to cross.
+	const rows, size = evictionSampleSize + 500, 1000
+	ctx := context.Background()
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO outputs(output_id, size, compressed_size, accessed_at) VALUES (?, ?, ?, 5000)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Close() //nolint:errcheck
+	for i := range rows {
+		output := sha256.Sum256(fmt.Appendf(nil, "tied-%d", i))
+		if _, err := stmt.ExecContext(ctx, output[:], size, size); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Over budget by more than a single page can cover.
+	const wanted = evictionSampleSize + 200
+	st.maxSize = rows*size - wanted*size
+	candidates, err := st.planToMaxSize(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) < wanted {
+		t.Fatalf("planned %d candidates for %d needed: the page stopped at the tie",
+			len(candidates), wanted)
+	}
+	// And no candidate twice, which is the other way a cursor can go wrong.
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if _, dup := seen[candidate.outputID]; dup {
+			t.Fatalf("candidate %s planned twice", candidate.outputID)
+		}
+		seen[candidate.outputID] = struct{}{}
 	}
 }
