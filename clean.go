@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/gofrs/flock"
 )
@@ -61,7 +62,7 @@ func (st *store) cleanLocked() error {
 			_ = st.db.Close()
 			return err
 		}
-		if err := st.removeOrphans(orphans); err != nil {
+		if err := st.removeOrphans(orphans, time.Now()); err != nil {
 			_ = st.db.Close()
 			return err
 		}

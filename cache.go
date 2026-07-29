@@ -445,16 +445,30 @@ func (st *store) createLiveFile(outputHex string) (string, error) {
 func (st *store) installBlob(tmpPath, outputHex string) (int64, error) {
 	dst := st.blobPath(outputHex)
 	if regularFile(dst) {
-		return fileSize(dst)
+		return adoptBlob(dst)
 	}
-	err := os.Rename(tmpPath, dst)
-	if err == nil {
-		return fileSize(dst)
+	if err := os.Rename(tmpPath, dst); err != nil {
+		if !regularFile(dst) {
+			return 0, fmt.Errorf("install compressed file: %w", err)
+		}
+		// Another put installed the same content while this one was compressing.
+		return adoptBlob(dst)
 	}
-	if regularFile(dst) {
-		return fileSize(dst)
+	return fileSize(dst)
+}
+
+// adoptBlob takes over a blob that is already on disk, stamping it so it looks as
+// recently written as one this put installed itself. Until this put records its row
+// the file is unreferenced, and orphan removal spares a file only while it looks
+// that recent; a rename carries a fresh mtime for free, reusing an existing file
+// does not. Unconditional rather than throttled, because the stamp is the whole
+// guarantee and nothing else reads a blob's mtime.
+func adoptBlob(dst string) (int64, error) {
+	now := time.Now()
+	if err := os.Chtimes(dst, now, now); err != nil {
+		return 0, fmt.Errorf("stamp compressed file: %w", err)
 	}
-	return 0, fmt.Errorf("install compressed file: %w", err)
+	return fileSize(dst)
 }
 
 func (st *store) upsertEntry(ent entry) error {
@@ -743,11 +757,10 @@ type prunePlan struct {
 	entryCutoff int64
 	retained    []string         // expired retained files
 	blobs       []pruneCandidate // over-budget blobs, least recently used first
-	orphans     map[int][]string // shard index -> files with no catalog entry
 }
 
 func (p prunePlan) empty() bool {
-	return len(p.retained) == 0 && len(p.blobs) == 0 && len(p.orphans) == 0
+	return len(p.retained) == 0 && len(p.blobs) == 0
 }
 
 func (st *store) planPrune(now time.Time) (prunePlan, error) {
@@ -758,13 +771,6 @@ func (st *store) planPrune(now time.Time) (prunePlan, error) {
 		return prunePlan{}, err
 	}
 	if plan.blobs, err = st.planToMaxSize(plan.entryCutoff); err != nil {
-		return prunePlan{}, err
-	}
-	// Every inventoried output counts as a reference. The age pass runs on its own
-	// schedule now rather than inside this one, so there is nothing here that is
-	// about to be reaped and worth planning around; whatever it removes shows up as
-	// an orphan on a later pass.
-	if plan.orphans, err = st.planOrphans(true, keepEveryOutput); err != nil {
 		return prunePlan{}, err
 	}
 	return plan, nil
@@ -812,18 +818,12 @@ func (st *store) deletePlanned(plan prunePlan) error {
 	if err != nil {
 		return err
 	}
-	// The plan's orphan list was built before eviction, so an evicted output was
-	// still referenced then and its retained files were not candidates. Offer
-	// them now; removeOrphans re-queries the shard, so anything still referenced
-	// is kept.
-	st.addRetainedCandidates(plan.orphans, evicted)
-	if err := st.removeOrphans(plan.orphans); err != nil {
-		return err
-	}
-	if err := removeEmptyDirs(st.blobsDir); err != nil {
-		return err
-	}
-	return removeEmptyDirs(retainedRoot(st.versionDir))
+	// An evicted output has no inventory row left, so its retained files are
+	// unreferenced too, and nothing else in this pass would have looked at them.
+	// removeOrphans re-checks the shard, so anything referenced again is kept.
+	retained := make(map[int][]string)
+	st.addRetainedCandidates(retained, evicted)
+	return st.removeOrphans(retained, time.Now().Add(-orphanGrace))
 }
 
 // planToMaxSize lists blobs to evict, least recently used first, or nothing if
@@ -936,8 +936,43 @@ func (st *store) sweepUnlocked(now time.Time) error {
 	if err := st.sweepLiveRuns(now); err != nil {
 		return err
 	}
-	return st.pruneOldEntries(st.planOldEntries(now))
+	if err := st.pruneOldEntries(st.planOldEntries(now)); err != nil {
+		return err
+	}
+	// Unlinking a blob no build can reach costs nothing but the disk it frees: with
+	// no inventory row, no entry resolves to it, so no get will ever open it. The
+	// only file at risk is one a put has installed and not yet recorded, and
+	// orphanGrace is what spares that.
+	orphans, err := st.planOrphans(true, keepEveryOutput)
+	if err != nil {
+		return err
+	}
+	if err := st.removeOrphans(orphans, now.Add(-orphanGrace)); err != nil {
+		return err
+	}
+	if err := removeEmptyDirs(st.blobsDir); err != nil {
+		return err
+	}
+	return removeEmptyDirs(retainedRoot(st.versionDir))
 }
+
+// orphanGrace is how recently a file may have been written and still be spared by
+// orphan removal. A put installs its blob before recording it, so for that moment the
+// file is on disk with nothing referencing it. Removal used to be safe from that by
+// running only when no build was registered at all; running it on a busy cache needs
+// a different guard, and the file's own age is one.
+//
+// Retained files have no such window — they are written during close, for outputs
+// already in the inventory, so their reference exists before they do. The grace
+// applies to them anyway because one rule over both is simpler than two, and it
+// costs a retained file that has just become an orphan one pass.
+//
+// It only has to exceed the gap between a blob being installed and its row landing,
+// which is one transaction against a 5s busy timeout, and installBlob stamps the
+// file on both of its paths — so nothing older than this can be a put in flight. A
+// minute leaves two orders of magnitude of headroom, and keeping it short is what
+// makes the disk come back promptly instead of an hour later.
+const orphanGrace = time.Minute
 
 // keepEveryOutput disables the access-time filter in referencedInShard. Zero
 // would not do: accessed_at can be negative if the clock was ever behind 1970,
@@ -1149,7 +1184,11 @@ func (st *store) planOrphans(includeBlobs bool, entryCutoff int64) (map[int][]st
 	return orphans, nil
 }
 
-func (st *store) removeOrphans(orphans map[int][]string) error {
+// removeOrphans unlinks the planned files that are still unreferenced, skipping any
+// modified at or after modifiedBefore. That cutoff is what makes this safe to run
+// while builds are using the cache; a caller holding the cache idle can pass the
+// current time to spare nothing.
+func (st *store) removeOrphans(orphans map[int][]string, modifiedBefore time.Time) error {
 	if len(orphans) == 0 {
 		return nil
 	}
@@ -1167,6 +1206,12 @@ func (st *store) removeOrphans(orphans map[int][]string) error {
 		for _, path := range orphans[shard] {
 			outputID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 			if _, ok := referenced[outputID]; ok {
+				continue
+			}
+			// Re-stat at the moment of deletion rather than trusting the walk: a put
+			// may have installed this file since, in which case its mtime is now and
+			// it is not ours to take.
+			if info, err := os.Stat(path); err == nil && !info.ModTime().Before(modifiedBefore) {
 				continue
 			}
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {

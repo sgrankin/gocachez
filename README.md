@@ -248,8 +248,15 @@ it pages oldest-first and stops once it has freed enough, rather than ordering
 the whole cache. On a cache with high key churn most candidates are equally cold,
 so paying to rank them exactly buys nothing.
 
-Both limits are enforced by a maintenance scan that runs at most once an hour,
-and only when no build is using the cache — the scan is proportional to the size
+Expiring catalog rows and collecting files nothing references run at most once an
+hour and do not wait for the cache to be idle: deleting a row touches no disk, and a
+file no catalog row names cannot be reached by any build. A file written within the
+last minute is spared regardless, because that is what a put still recording itself
+looks like.
+
+Evicting to `maxSize` is different — it takes blobs that entries still resolve to,
+and a build may be reading one — so that runs at most once an hour and
+only when no build is using the cache — the scan is proportional to the size
 of the cache, and the `go` command waits for `gocachez` to exit, so running it
 on every build would add that cost to every build. `maxSize` is therefore a
 target rather than a hard cap: the cache can exceed it between scans. A single

@@ -1171,6 +1171,7 @@ func TestPruneRemovesOrphanRetainedFiles(t *testing.T) {
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
+	ageCacheFiles(t, st)
 	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
@@ -1440,7 +1441,7 @@ func TestPruneSkipsScanWhileLifecycleLockIsHeld(t *testing.T) {
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
-	blobPath := orphanBlob(t, st, strings.Repeat("d", 64))
+	blobPath := overBudgetBlob(t, st, 0xd0)
 
 	lock := flock.New(st.lifecycleLockPath)
 	if err := lock.Lock(); err != nil {
@@ -1589,6 +1590,10 @@ func TestPruneRemovesOrphanBlobsWithSizePruningDisabled(t *testing.T) {
 
 // orphanBlob writes a blob file with no catalog entry, which only a
 // maintenance scan removes.
+// orphanBlob leaves a blob no catalog row names, backdated past orphanGrace. An
+// orphan a scan should collect is by definition one that has been sitting there; a
+// file written this instant is indistinguishable from a put mid-flight, and removal
+// spares those on purpose.
 func orphanBlob(t *testing.T, st *store, outputID string) string {
 	t.Helper()
 	if err := os.MkdirAll(st.blobDir(outputID), 0o777); err != nil {
@@ -1598,7 +1603,29 @@ func orphanBlob(t *testing.T, st *store, outputID string) string {
 	if err := os.WriteFile(path, []byte("orphan"), 0o666); err != nil {
 		t.Fatal(err)
 	}
+	aged := time.Now().Add(-2 * orphanGrace)
+	if err := os.Chtimes(path, aged, aged); err != nil {
+		t.Fatal(err)
+	}
 	return path
+}
+
+// ageCacheFiles backdates every blob and retained file past orphanGrace, for tests
+// whose premise is a cache that has been sitting unused rather than one being
+// written to right now.
+func ageCacheFiles(t *testing.T, st *store) {
+	t.Helper()
+	aged := time.Now().Add(-2 * orphanGrace)
+	for _, root := range []string{st.blobsDir, retainedRoot(st.versionDir)} {
+		if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil //nolint:nilerr // a tree that is not there has nothing to age
+			}
+			return os.Chtimes(path, aged, aged)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestPruneSkipsScanWithinInterval(t *testing.T) {
@@ -1655,7 +1682,7 @@ func TestPlanPruneDoesNotTakeTheLifecycleLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.close()
-	orphanBlob(t, st, strings.Repeat("f", 64))
+	overBudgetBlob(t, st, 0xf0)
 
 	// Deciding what to remove is the expensive part of a scan. Holding the lock
 	// across it is what stalled a starting build, since newStore takes the same
@@ -2738,6 +2765,7 @@ func TestPruneRemovesRetainedFilesOfEvictedOutputs(t *testing.T) {
 	// Room for one output, so the older of the two is evicted by size — not by
 	// age, which would have taken its retained file along a different path.
 	st.maxSize = total * 2 / 3
+	ageCacheFiles(t, st)
 	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
@@ -2763,22 +2791,33 @@ func TestPruneDeletesNothingWhileARunIsRegistered(t *testing.T) {
 	}
 	defer st.close()
 
-	// This store's own run is registered, so the cache is in use. put and get
-	// never take the lifecycle lock, so an idle cache is the only thing that
-	// makes deletion safe — nothing may go while a build could be writing.
-	blobPath := orphanBlob(t, st, strings.Repeat("9", 64))
+	// This store's own run is registered, so the cache is in use. Eviction takes
+	// blobs that entries still resolve to, and a build may be materialising one, so
+	// that is the half an idle cache is still required for.
+	actionID := bytes.Repeat([]byte{88}, 32)
+	outputID := bytes.Repeat([]byte{89}, 32)
+	body := incompressibleBody(t, 4096, 3)
+	if _, err := st.put(request{
+		ID: 1, Command: cmdPut, ActionID: actionID, OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	blobPath := st.blobPath(hexOf(outputID))
+	st.maxSize = 1
+
 	plan, err := st.planPrune(time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.orphans) == 0 {
-		t.Fatal("planPrune did not see the orphan blob")
+	if len(plan.blobs) == 0 {
+		t.Fatal("planPrune did not plan the over-budget blob")
 	}
 	if err := st.applyPrune(plan); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(blobPath); err != nil {
-		t.Fatalf("prune deleted while a run was registered: %v", err)
+		t.Fatalf("evicted while a run was registered: %v", err)
 	}
 	// And it must not stamp, or the scan it declined would be skipped for an
 	// hour after the cache went idle.
@@ -2801,12 +2840,16 @@ func TestPruneKeepsOrphanThatGainedAnEntryAfterPlanning(t *testing.T) {
 
 	outputID := strings.Repeat("7", 64)
 	blobPath := orphanBlob(t, st, outputID)
-	plan, err := st.planPrune(time.Now())
+	aged := time.Now().Add(-2 * orphanGrace)
+	if err := os.Chtimes(blobPath, aged, aged); err != nil {
+		t.Fatal(err)
+	}
+	orphans, err := st.planOrphans(true, keepEveryOutput)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.orphans) == 0 {
-		t.Fatal("planPrune did not see the orphan blob")
+	if len(orphans) == 0 {
+		t.Fatal("planOrphans did not see the orphan blob")
 	}
 
 	// A put writes its blob before inserting the catalog row, so a blob can be
@@ -2823,7 +2866,7 @@ func TestPruneKeepsOrphanThatGainedAnEntryAfterPlanning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.applyPrune(plan); err != nil {
+	if err := st.removeOrphans(orphans, time.Now().Add(-orphanGrace)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(blobPath); err != nil {
@@ -2912,7 +2955,7 @@ func TestPruneRechecksStampAfterTakingTheLock(t *testing.T) {
 	// rather than repeating it. Planning and then applying against a stamp that
 	// went fresh in between is exactly that process, and prune() cannot reach
 	// the state on its own.
-	blobPath := orphanBlob(t, st, strings.Repeat("e", 64))
+	blobPath := overBudgetBlob(t, st, 0xe0)
 	plan, err := st.planPrune(time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -3000,19 +3043,22 @@ func TestPruneScansEarlyWhenRunInstallsLargeShareOfBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A fresh stamp would normally hold the scan off for pruneInterval, but a
-	// run that adds this much of the budget cannot wait without overshooting.
-	blobPath := orphanBlob(t, st, strings.Repeat("b", 64))
-	body := bytes.Repeat([]byte("cache me"), 256)
+	// A fresh stamp would normally hold the scan off for pruneInterval, but a run
+	// that adds this much of the budget cannot wait without overshooting. The body
+	// is incompressible and larger than the budget, so the scan this triggers has a
+	// genuine eviction to make at the configured maxSize rather than a contrived one.
+	outputID := bytes.Repeat([]byte{94}, 32)
+	body := incompressibleBody(t, maxSize*2, 11)
 	if _, err := st.put(request{
 		ID:       1,
 		Command:  cmdPut,
 		ActionID: bytes.Repeat([]byte{93}, 32),
-		OutputID: bytes.Repeat([]byte{94}, 32),
+		OutputID: outputID,
 		BodySize: int64(len(body)),
 	}, bufio.NewReader(encodedBody(body))); err != nil {
 		t.Fatal(err)
 	}
+	blobPath := st.blobPath(hexOf(outputID))
 	// put must be what feeds the gate; without this wiring the escape hatch
 	// can never fire in production no matter what the threshold is.
 	put := st.installed.Load()
@@ -3024,7 +3070,7 @@ func TestPruneScansEarlyWhenRunInstallsLargeShareOfBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
-		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+		t.Fatalf("over-budget blob stat err = %v, want not exist", err)
 	}
 	if got := st.installed.Load(); got != 0 {
 		t.Fatalf("installed = %d after scan, want 0", got)
@@ -3049,8 +3095,10 @@ func TestPruneScansWhenStampIsDatedInTheFuture(t *testing.T) {
 
 	// Clock skew or a restored backup must not lock maintenance out.
 	ahead := time.Now().Add(24 * time.Hour)
-	if err := os.Chtimes(pruneStampPath(st.versionDir), ahead, ahead); err != nil {
-		t.Fatal(err)
+	for _, stamp := range []string{pruneStampPath(st.versionDir), sweepStampPath(st.versionDir)} {
+		if err := os.Chtimes(stamp, ahead, ahead); err != nil {
+			t.Fatal(err)
+		}
 	}
 	blobPath := orphanBlob(t, st, strings.Repeat("c", 64))
 	if err := st.prune(); err != nil {
@@ -3398,6 +3446,7 @@ func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
 	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
+	ageCacheFiles(t, st)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -3878,6 +3927,7 @@ func TestRunPruneDeletesInsideTheInterval(t *testing.T) {
 		t.Fatalf("close did not stamp, so the interval is not what blocks: %v", err)
 	}
 
+	ageCacheFiles(t, st)
 	var stdout bytes.Buffer
 	if err := run([]string{"prune", "-dir", cacheDir, "-max-age", "5d"}, strings.NewReader(""), &stdout); err != nil {
 		t.Fatal(err)
@@ -6048,6 +6098,7 @@ func TestPruneReclaimsAnOutputNoEntryNamesAnyMore(t *testing.T) {
 		`DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
+	ageCacheFiles(t, st)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -6325,5 +6376,110 @@ func TestAgeExpiryRunsWhileARunIsRegistered(t *testing.T) {
 	// pass that finds the cache quiet.
 	if _, err := os.Stat(st.blobPath(hexOf(outputID))); err != nil {
 		t.Errorf("unlinked a blob while a run was registered: %v", err)
+	}
+}
+
+// overBudgetBlob installs one output and drops maxSize below it, so the half of
+// maintenance that still requires an idle cache — eviction, which takes blobs that
+// entries resolve to — has something to do. Orphan collection is no longer gated, so
+// it cannot be what a test of that gate observes.
+func overBudgetBlob(t *testing.T, st *store, seed byte) string {
+	t.Helper()
+	output := bytes.Repeat([]byte{seed + 1}, 32)
+	body := incompressibleBody(t, 4096, int64(seed))
+	if _, err := st.put(request{
+		ID: 1, Command: cmdPut, ActionID: bytes.Repeat([]byte{seed}, 32),
+		OutputID: output, BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	st.maxSize = 1
+	// The put fed the overshoot counter, which would make pruneDue true on its own
+	// and decide the outcome of tests that are about the stamp instead.
+	st.installed.Store(0)
+	return st.blobPath(hexOf(output))
+}
+
+// Orphan collection no longer waits for the cache to fall idle, so what protects a
+// put mid-flight is the file's age: between installing a blob and recording it, the
+// file is on disk with nothing referencing it and looks exactly like an orphan.
+func TestOrphanCollectionSparesAFileAPutMayStillBeWriting(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	// This store's run stays registered throughout: the point is that collection
+	// happens anyway, and that the grace is what draws the line.
+	fresh := st.blobPath(strings.Repeat("a", 64))
+	if err := os.MkdirAll(filepath.Dir(fresh), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fresh, []byte("just installed"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	aged := orphanBlob(t, st, strings.Repeat("b", 64))
+
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("took a blob that could have been a put in flight: %v", err)
+	}
+	if _, err := os.Stat(aged); !os.IsNotExist(err) {
+		t.Errorf("aged orphan stat err = %v, want not exist — collection did not run on a busy cache", err)
+	}
+}
+
+// A put that finds its output already on disk installs nothing, so it gets no fresh
+// mtime from the rename — and it still spends a moment with the file present and the
+// row not yet written. Without a stamp of its own that put is exactly what orphan
+// collection cannot tell from an abandoned file.
+func TestPutStampsABlobItDidNotInstall(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	outputID := bytes.Repeat([]byte{55}, 32)
+	body := []byte("shared content")
+	if _, err := st.put(request{
+		ID: 1, Command: cmdPut, ActionID: bytes.Repeat([]byte{56}, 32),
+		OutputID: outputID, BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	blobPath := st.blobPath(hexOf(outputID))
+	stale := time.Now().Add(-2 * orphanGrace)
+	if err := os.Chtimes(blobPath, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second action producing the same output takes the already-installed path.
+	if _, err := st.put(request{
+		ID: 2, Command: cmdPut, ActionID: bytes.Repeat([]byte{57}, 32),
+		OutputID: outputID, BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(blobPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().After(stale) {
+		t.Fatalf("blob mtime %v was not refreshed by the put that adopted it", info.ModTime())
+	}
+	if time.Since(info.ModTime()) >= orphanGrace {
+		t.Fatalf("blob mtime is %v old, outside the grace that spares a put in flight",
+			time.Since(info.ModTime()))
 	}
 }
