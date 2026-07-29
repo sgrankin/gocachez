@@ -376,6 +376,22 @@ WHERE output_id = ? AND accessed_at <= ?`, idKey(outputID), accessedAt)
 // 200k-row transaction stalled a concurrent put for 3.9s of its 5s.
 const ageBatch = 2000
 
+// ageMaxBatches bounds how many batches one pass over outputs will delete. Unlike
+// entries, that loop has no cursor to advance — it re-selects the oldest rows each time
+// — so it ends only when nothing is stale, and rows appearing below the cutoff as fast as
+// they are removed would keep it going forever.
+//
+// Nothing in normal operation approaches this. A new row is stamped with now, so it is
+// stale only if the clock has gone backwards by more than maxAge — a chrony step at boot
+// on a machine whose clock was wrong, or a VM resumed from a snapshot. What makes it
+// worth bounding anyway is where the loop runs: sweepUnlocked is on the path the go
+// command waits for, so spinning here does not degrade a build, it wedges it.
+//
+// 2000 batches is four million rows, around fifteen times the whole outputs table at the
+// size this was measured against, and stopping early is logged rather than passed off as
+// a completed pass.
+const ageMaxBatches = 2000
+
 // deleteAccessedBefore expires both tables. outputs is the one that frees disk:
 // its rows are what keeps a blob from being an orphan, so an implementation that
 // reaped only entries would leave maxAge quietly reclaiming nothing.
@@ -443,7 +459,7 @@ LIMIT ?`, cutoff, after, ageBatch)
 // a seek rather than a scan, so removing one batch leaves the next at hand.
 func (c *catalog) deleteStaleOutputs(ctx context.Context, cutoff int64) (int64, error) {
 	var total int64
-	for {
+	for batch := range ageMaxBatches {
 		ids, err := c.staleOutputIDs(ctx, cutoff)
 		if err != nil {
 			return total, err
@@ -456,7 +472,15 @@ func (c *catalog) deleteStaleOutputs(ctx context.Context, cutoff int64) (int64, 
 		if err != nil {
 			return total, err
 		}
+		if batch == ageMaxBatches-1 {
+			// Unconditional, not under -v: reaching this means rows are being written
+			// below a cutoff derived from the same clock, which nothing in normal
+			// operation does. See ageMaxBatches.
+			log.Printf("gocachez: age expiry stopped after %d batches with rows still "+
+				"below the cutoff; check the system clock", ageMaxBatches)
+		}
 	}
+	return total, nil
 }
 
 func (c *catalog) staleOutputIDs(ctx context.Context, cutoff int64) ([][]byte, error) {

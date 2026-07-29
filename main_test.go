@@ -7344,3 +7344,54 @@ func TestARetainedFileThatCannotBeDeletedDoesNotStopSizeEviction(t *testing.T) {
 		t.Errorf("over-budget blob stat err = %v, want not exist", err)
 	}
 }
+
+// The outputs half of age expiry has no cursor to advance — it re-selects the oldest rows
+// each pass — so it ends only when nothing is stale. Rows appearing below the cutoff as
+// fast as they are removed would keep it going forever, and it runs on the path the go
+// command waits for, so that wedges a build rather than degrading it. A trigger that
+// re-inserts a stale row on every delete is that situation exactly.
+func TestAgeExpiryStopsInsteadOfSpinningOnRowsThatKeepReappearing(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	ctx := context.Background()
+	stale := unixMillis(time.Now().Add(-90 * 24 * time.Hour))
+	if _, err := st.db.ExecContext(ctx,
+		`INSERT INTO outputs(output_id, size, compressed_size, accessed_at) VALUES (?, 0, 0, ?)`,
+		bytes.Repeat([]byte{81}, 32), stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+CREATE TRIGGER outputs_respawn AFTER DELETE ON outputs BEGIN
+	INSERT INTO outputs(output_id, size, compressed_size, accessed_at)
+	VALUES (randomblob(32), 0, 0, OLD.accessed_at);
+END`); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		removed int64
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		removed, err := st.q.deleteStaleOutputs(ctx, unixMillis(time.Now().Add(-24*time.Hour)))
+		done <- result{removed, err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.removed != ageMaxBatches {
+			t.Errorf("removed %d rows, want the bound of %d", got.removed, ageMaxBatches)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("age expiry did not return: the loop is unbounded, which wedges a build")
+	}
+}
