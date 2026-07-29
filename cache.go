@@ -575,7 +575,7 @@ func (st *store) prune() error {
 	// lifecycle lock: a build opening a store must never wait on maintenance.
 	ran, err := withFileLockIfFree(maintenanceLockPath(st.versionDir), func() error {
 		if sweepDue {
-			if err := st.sweepLiveRuns(now); err != nil {
+			if err := st.sweepUnlocked(now); err != nil {
 				return err
 			}
 			if err := st.markSwept(); err != nil {
@@ -737,17 +737,17 @@ type prunePlan struct {
 	// Deletion re-reads mtimes but compares them to this, so the re-check can
 	// only ever keep more than the plan chose, never less.
 	retainedCutoff time.Time
-	entryCutoff    int64            // delete entries unused since this; 0 for none
-	retained       []string         // expired retained files
-	blobs          []pruneCandidate // over-budget blobs, least recently used first
-	orphans        map[int][]string // shard index -> files with no catalog entry
+	// entryCutoff is where eviction starts looking. Anything older is the age
+	// pass's to remove, so listing it for eviction as well is wasted work. It is
+	// not itself applied here — sweepUnlocked does that, without the idle gate.
+	entryCutoff int64
+	retained    []string         // expired retained files
+	blobs       []pruneCandidate // over-budget blobs, least recently used first
+	orphans     map[int][]string // shard index -> files with no catalog entry
 }
 
 func (p prunePlan) empty() bool {
-	return p.entryCutoff == 0 &&
-		len(p.retained) == 0 &&
-		len(p.blobs) == 0 &&
-		len(p.orphans) == 0
+	return len(p.retained) == 0 && len(p.blobs) == 0 && len(p.orphans) == 0
 }
 
 func (st *store) planPrune(now time.Time) (prunePlan, error) {
@@ -760,9 +760,11 @@ func (st *store) planPrune(now time.Time) (prunePlan, error) {
 	if plan.blobs, err = st.planToMaxSize(plan.entryCutoff); err != nil {
 		return prunePlan{}, err
 	}
-	// Inventory rows this scan is about to reap must not count as references, or
-	// the blobs they account for would survive until the next scan.
-	if plan.orphans, err = st.planOrphans(true, plan.entryCutoff); err != nil {
+	// Every inventoried output counts as a reference. The age pass runs on its own
+	// schedule now rather than inside this one, so there is nothing here that is
+	// about to be reaped and worth planning around; whatever it removes shows up as
+	// an orphan on a later pass.
+	if plan.orphans, err = st.planOrphans(true, keepEveryOutput); err != nil {
 		return prunePlan{}, err
 	}
 	return plan, nil
@@ -802,9 +804,6 @@ func (st *store) applyPrune(plan prunePlan) error {
 func (st *store) deletePlanned(plan prunePlan) error {
 	if plan.empty() {
 		return nil
-	}
-	if err := st.pruneOldEntries(plan.entryCutoff); err != nil {
-		return err
 	}
 	if err := st.removeExpiredRetainedFiles(plan.retained, plan.retainedCutoff); err != nil {
 		return err
@@ -919,6 +918,25 @@ func (st *store) evictToMaxSize(candidates []pruneCandidate) ([]string, error) {
 		log.Printf("gocachez: pruned %d blobs, compressed size now %s", len(evicted), formatSize(total))
 	}
 	return evicted, nil
+}
+
+// sweepUnlocked does the maintenance that does not need the cache to be idle:
+// reclaiming the directories of runs that are gone, and expiring catalog rows by
+// age.
+//
+// Age expiry used to sit inside the gated scan with everything else, which on a
+// host that always has a build running meant it never happened — and the catalog,
+// not the blobs, is what had grown to 3.1GiB there. It does not belong behind that
+// gate. Deleting a row touches no disk; only unlinking a blob does, and that stays
+// gated. The worst a concurrent build sees is a miss on something it had not read
+// in maxAge plus the hour of slack trimCutoff adds, which is a rebuild, not a wrong
+// answer — and the 30s access flush is well inside that hour, so an entry actually
+// in use is never a candidate.
+func (st *store) sweepUnlocked(now time.Time) error {
+	if err := st.sweepLiveRuns(now); err != nil {
+		return err
+	}
+	return st.pruneOldEntries(st.planOldEntries(now))
 }
 
 // keepEveryOutput disables the access-time filter in referencedInShard. Zero

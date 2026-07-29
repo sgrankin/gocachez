@@ -6263,3 +6263,67 @@ func TestAbandonedRunIsReclaimedAfterTheCacheMoves(t *testing.T) {
 		t.Errorf("abandoned run dir stat err = %v, want not exist", err)
 	}
 }
+
+// Age expiry must not wait for the cache to fall idle. On a host that always has a
+// build running it never does, which is how a production catalog reached 3.1GiB
+// while the blobs were within budget. Deleting a catalog row touches no disk, so
+// only the blob unlink needs the idle gate — and this asserts the split both ways.
+func TestAgeExpiryRunsWhileARunIsRegistered(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	actionID := bytes.Repeat([]byte{61}, 32)
+	outputID := bytes.Repeat([]byte{62}, 32)
+	body := []byte("aged out")
+	if _, err := st.put(request{
+		ID: 1, Command: cmdPut, ActionID: actionID, OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	stale := unixMillis(trimCutoff(defaultMaxAge, time.Now())) - int64(time.Minute/time.Millisecond)
+	for _, table := range []string{"entries", "outputs"} {
+		if _, err := st.db.ExecContext(context.Background(),
+			`UPDATE `+table+` SET accessed_at = ?`, stale); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// This store's own run stays registered, so the cache is in use throughout.
+	active, err := st.q.countRuns(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active == 0 {
+		t.Fatal("no run registered, so this would not exercise the busy case")
+	}
+
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.lookupEntry(hexOf(actionID)); !errorsIs(err, sql.ErrNoRows) {
+		t.Fatalf("stale entry survived a busy cache: %v", err)
+	}
+	var inventoried int
+	if err := st.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM outputs WHERE output_id = ?`,
+		idKey(hexOf(outputID))).Scan(&inventoried); err != nil {
+		t.Fatal(err)
+	}
+	if inventoried != 0 {
+		t.Error("stale output survived a busy cache")
+	}
+	// The blob is a different matter: unlinking it races a build that may be
+	// materialising, so that half stays behind the idle gate and is left for a
+	// pass that finds the cache quiet.
+	if _, err := os.Stat(st.blobPath(hexOf(outputID))); err != nil {
+		t.Errorf("unlinked a blob while a run was registered: %v", err)
+	}
+}

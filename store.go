@@ -189,11 +189,13 @@ func pruneStampPath(versionDir string) string {
 	return filepath.Join(versionDir, "prune.stamp")
 }
 
-// sweepStampPath names the file whose mtime records the last completed live-run
-// sweep. The sweep has a stamp of its own because prune.stamp is only written
-// when a scan actually deletes, which needs an idle cache: sharing one stamp
-// would either make the sweep re-walk on every exit of a busy cache, or spend
-// the scan's hourly budget on hours when it could not have pruned anyway.
+// sweepStampPath names the file whose mtime records the last completed pass of the
+// maintenance that needs no idle cache — reclaiming dead runs, and expiring catalog
+// rows by age. It has a stamp of its own because prune.stamp is only written when
+// the gated scan actually deletes: sharing one would either make this pass re-run on
+// every exit of a busy cache, or spend the gated scan's hourly budget on hours when
+// it could not have pruned anyway, which is how age expiry came to never happen
+// there at all.
 func sweepStampPath(versionDir string) string {
 	return filepath.Join(versionDir, "sweep.stamp")
 }
