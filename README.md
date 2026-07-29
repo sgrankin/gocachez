@@ -265,7 +265,11 @@ it cannot hold it.
 Expiring retained `go list` files is the one thing that does wait. Those paths are
 handed to tooling that may hold them for as long as a job runs, and nothing about the
 file says whether anyone does. That runs at most once an hour and
-only when no build is using the cache — the scan is proportional to the size
+only when no build is using the cache. It is attempted on every exit until it
+succeeds, rather than once an interval: an attempt that finds the cache busy costs a
+lock and a count, and only one that will proceed pays for the walk. Sampling hourly
+for an idle moment on a machine that is busy almost always would mean these never
+expired — the scan is proportional to the size
 of the cache, and the `go` command waits for `gocachez` to exit, so running it
 on every build would add that cost to every build. `maxSize` is therefore a
 target rather than a hard cap: the cache can exceed it between scans. A single
