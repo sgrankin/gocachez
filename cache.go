@@ -954,10 +954,47 @@ func (st *store) sweepUnlocked(now time.Time) error {
 	if err := st.removeOrphans(orphans, now.Add(-orphanGrace)); err != nil {
 		return err
 	}
+	if err := st.removeStalePendingBlobs(now); err != nil {
+		return err
+	}
 	if err := removeEmptyDirs(st.blobsDir); err != nil {
 		return err
 	}
 	return removeEmptyDirs(retainedRoot(st.versionDir))
+}
+
+// pendingBlobPattern matches the temporary file a put compresses into, which lives
+// beside the blob it becomes so that installing it is a rename within one directory.
+const pendingBlobPattern = "*-pending-*.zst"
+
+// removeStalePendingBlobs collects the temporary files of puts that died before
+// installing or removing them. Orphan collection deliberately ignores these, because
+// it cannot tell one from a put in progress; age can, and mtimeInterval is far longer
+// than any put while still bounding how long a dead one occupies disk.
+func (st *store) removeStalePendingBlobs(now time.Time) error {
+	cutoff := now.Add(-mtimeInterval)
+	matches, err := filepath.Glob(filepath.Join(st.blobsDir, "*", pendingBlobPattern))
+	if err != nil {
+		return fmt.Errorf("scan pending blobs: %w", err)
+	}
+	var errs error
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			errs = errors.Join(errs, err)
+			continue
+		}
+		if !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = errors.Join(errs, err)
+		}
+	}
+	return errs
 }
 
 // orphanGrace is how recently a file may have been written and still be spared by
@@ -1293,6 +1330,16 @@ func orphanFilesInDir(root string, referenced map[string]struct{}, extensions ..
 			return nil
 		}
 		outputID := strings.TrimSuffix(filepath.Base(path), ext)
+		// A put compresses into <output>-pending-<random>.zst in the same shard, so
+		// an in-flight put looks exactly like an unreferenced blob: its name is not
+		// an output ID, so nothing references it. That was harmless while collection
+		// only ran with no build registered. It is not now — unlinking one makes the
+		// rename that installs it fail, and the put fails with it — and the mtime
+		// grace does not cover a put stalled longer than that. Leftovers from a
+		// killed put are collected by removeStalePendingBlobs instead.
+		if strings.Contains(outputID, "-") {
+			return nil
+		}
 		if _, ok := referenced[outputID]; !ok {
 			orphans = append(orphans, path)
 		}

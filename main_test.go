@@ -6535,3 +6535,55 @@ func TestScanTruncatesTheWriteAheadLog(t *testing.T) {
 		t.Errorf("write-ahead log is %d bytes after a scan, was %d", after.Size(), before.Size())
 	}
 }
+
+// A put compresses into a temporary file beside the blob it becomes, in the same
+// shard and with the same extension, so it is indistinguishable from an
+// unreferenced blob by name alone. Collecting one makes the rename that installs it
+// fail, and the put fails with it — a build error, not a miss.
+func TestOrphanCollectionIgnoresAPendingPut(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	outputHex := strings.Repeat("c", 64)
+	shard := st.blobDir(outputHex)
+	if err := os.MkdirAll(shard, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	pending := filepath.Join(shard, outputHex+"-pending-12345.zst")
+	if err := os.WriteFile(pending, []byte("half compressed"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	// Older than the grace: age must not be what saves it, because a put can stall
+	// for longer than that.
+	stalled := time.Now().Add(-2 * orphanGrace)
+	if err := os.Chtimes(pending, stalled, stalled); err != nil {
+		t.Fatal(err)
+	}
+
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pending); err != nil {
+		t.Fatalf("collected a put's pending file: %v", err)
+	}
+
+	// But one left behind by a put that died does have to go, or it occupies disk
+	// with nothing ever coming back for it.
+	dead := time.Now().Add(-2 * mtimeInterval)
+	if err := os.Chtimes(pending, dead, dead); err != nil {
+		t.Fatal(err)
+	}
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pending); !os.IsNotExist(err) {
+		t.Fatalf("abandoned pending file stat err = %v, want not exist", err)
+	}
+}
