@@ -55,11 +55,10 @@ const (
 	// outputs_accessed_at. Steps repeat until the overshoot is covered, trading a
 	// few bounded queries for never ordering the whole catalog at once.
 	//
-	// It is a target rather than a hard cap: a step takes every entry sharing its
-	// watermark timestamp, since stopping mid-timestamp would skip entries a
-	// later step can no longer reach. Access times are milliseconds, so a step
-	// only grows past this when many entries were touched in the same
-	// millisecond.
+	// It is a hard cap, and outputs sharing the last row's access time may be left
+	// for the next page rather than pulled in to keep the timestamp whole. That only
+	// ever yields fewer candidates than ideal, which evictToMaxSize already
+	// tolerates: it re-reads the real total and stops at the budget either way.
 	evictionSampleSize = 2048
 
 	// accessFlushInterval bounds how long a cache hit stays invisible to the
@@ -501,11 +500,13 @@ func (st *store) dropAction(actionID, outputID string) error {
 // across the analysis is what stalled a starting build for the length of a
 // whole scan. Only the deletions take it.
 //
-// What the lock guarantees is unchanged: nothing is removed unless the cache is
-// idle. put and get never take it, so "no run is registered" is what makes
-// removal safe, and applyPrune re-confirms that under the lock. Because the
-// analysis ran unlocked, applyPrune also re-verifies what it is about to
-// delete — see prunePlan.
+// What the lock guarantees is narrower than it once was: eviction and retained-file
+// expiry do not run unless the cache is idle. put and get never take the lock, so
+// "no run is registered" is what makes it safe to take a blob an entry still
+// resolves to, and applyPrune re-confirms that under the lock. Because the analysis
+// ran unlocked, applyPrune also re-verifies what it is about to delete — see
+// prunePlan. Expiring catalog rows by age and collecting files nothing references
+// are not in this plan at all; see sweepUnlocked for why they need no idle cache.
 //
 // That invariant has one gap, and it predates the split: unregisterRun deletes
 // its row before writing retained files and stamping run.lock, so a closing
@@ -519,9 +520,11 @@ func (st *store) dropAction(actionID, outputID string) error {
 // that, so its cost lands on a build. A CI job can run this between steps
 // instead, where the same work costs nobody's build latency.
 //
-// It cannot delete blobs or entries while another build is registered — that is
-// what makes deletion safe and is not something an explicit request can waive —
-// so it says as much rather than reporting nothing and looking successful.
+// It expires catalog rows by age and collects files nothing references whatever else
+// is running. What it cannot do while another build is registered is evict to
+// maxSize or expire retained files, because those take things a build may still be
+// reading, and that is not something an explicit request can waive — so it says as
+// much rather than reporting nothing and looking successful.
 func pruneCache(cfg config, stdout io.Writer) error {
 	versionDir, blobsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
 	dbPath := filepath.Join(versionDir, "cache.db")
@@ -566,7 +569,7 @@ func pruneCache(cfg config, stdout io.Writer) error {
 		return fmt.Errorf("count active runs: %w", err)
 	}
 	if active > 0 {
-		if _, err := fmt.Fprintf(stdout, "gocachez: %d build(s) still using the cache; only live-run cleanup can run\n", active); err != nil {
+		if _, err := fmt.Fprintf(stdout, "gocachez: %d build(s) still using the cache; size eviction is deferred\n", active); err != nil {
 			return fmt.Errorf("report active runs: %w", err)
 		}
 	}

@@ -4891,14 +4891,34 @@ func TestCatalogSchemaRejectsHexKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := st.db.ExecContext(ctx,
-		`UPDATE entries SET output_id = ? WHERE action_id = ?`, outputHex, idKey(actionHex)); err == nil {
-		t.Fatal("stored a hex string in a BLOB key column")
-	}
-	if _, err := st.db.ExecContext(ctx,
-		`INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
-		 VALUES (?, ?, 1, 1, 0, 0)`, actionHex, idKey(outputHex)); err == nil {
-		t.Fatal("inserted a hex string as an action ID")
+	// Assert on what the error says, not merely that there was one: a statement that
+	// fails because it names a column the table does not have would satisfy "some
+	// error" while proving nothing about typing, which is how this test came to pass
+	// vacuously once the schema moved underneath it.
+	const wantMsg = "cannot store TEXT value in BLOB column"
+	for _, tc := range []struct {
+		what  string
+		query string
+		args  []any
+	}{
+		{
+			"an output ID as hex text",
+			`UPDATE outputs SET output_id = ? WHERE output_id = ?`,
+			[]any{outputHex, idKey(outputHex)},
+		},
+		{
+			"an action ID as hex text",
+			`INSERT INTO entries(action_id, output, created_at, accessed_at) VALUES (?, 1, 0, 0)`,
+			[]any{actionHex},
+		},
+	} {
+		_, err := st.db.ExecContext(ctx, tc.query, tc.args...)
+		if err == nil {
+			t.Fatalf("stored %s", tc.what)
+		}
+		if !strings.Contains(err.Error(), wantMsg) {
+			t.Fatalf("storing %s failed with %q, want it to mention %q", tc.what, err, wantMsg)
+		}
 	}
 
 	// The round trip still works, so the rejection above is about the type and not
