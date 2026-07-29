@@ -90,6 +90,11 @@ $ gocachez status
 maintenance pass last completed. It reads only the catalog and the directory
 entries, so its cost does not depend on how much is stored.
 
+"Cached actions" is an upper bound. Evicting a blob does not hunt down the
+actions that named it — nothing indexes that direction — so an action can outlive
+its output and be reported until the next age pass, or until a build asks for it
+and gets a miss. "Cached outputs" is what is actually on disk.
+
 Add `-types` for a breakdown of what the cache holds by kind:
 
 ```console
@@ -138,7 +143,7 @@ To support those tools without keeping large uncompressed archives around,
 replaced with small archives containing only their `__.PKGDEF` export data, and
 generated Go source files that can appear in list output are retained as-is.
 These retained files are stored under `retained/`, keyed by output ID, and are
-cleaned up once no catalog entry references that output.
+cleaned up once the catalog no longer lists that output.
 
 ## Configuration
 
@@ -230,16 +235,17 @@ use is safe: its mtime is refreshed as builds touch it, and the cutoff allows a
 further `mtimeInterval` (1h) of slack on top of the configured age, so `1h`
 expires at about two.
 
-Age-based pruning is independent of `maxSize`: entries and retained files that
-have not been used within `maxAge` are trimmed even while the cache is under its
-size limit.
+Age-based pruning is independent of `maxSize`: outputs, the actions that name
+them, and retained files that have not been used within `maxAge` are trimmed even
+while the cache is under its size limit. An output expires on its own last read,
+so one that several actions share outlives whichever of them goes cold first.
 
-Size-based pruning evicts least-recently-used blobs, ranking an output by its
-most recent access across every action that maps to it. The ranking is
-approximate: rather than ordering the whole catalog, it walks the access-time
-index oldest-first in bounded steps and stops once it has freed enough. On a
-cache with high key churn most candidates are equally cold, so paying to rank
-them exactly buys nothing.
+Size-based pruning evicts least-recently-used blobs. Each output records when it
+was last read, so ranking is a page of the access-time index rather than a
+derivation across the actions that map to it. The ranking is still approximate:
+it pages oldest-first and stops once it has freed enough, rather than ordering
+the whole cache. On a cache with high key churn most candidates are equally cold,
+so paying to rank them exactly buys nothing.
 
 Both limits are enforced by a maintenance scan that runs at most once an hour,
 and only when no build is using the cache — the scan is proportional to the size
