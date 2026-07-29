@@ -66,7 +66,7 @@ type retainedTypeKind int
 // values use this version so classification changes can invalidate them.
 const retainedClassifierVersion = 1
 
-// retainedTypeKind values are persisted in entries.retained_type. Existing
+// retainedTypeKind values are persisted in outputs.retained_type. Existing
 // values must not be renumbered; append new kinds at the end.
 const (
 	retainedTypeExportArchive retainedTypeKind = iota
@@ -116,7 +116,7 @@ func writeStatus(cfg config, w io.Writer) error {
 		{"State", catalogState},
 		{"Cached actions", formatInt(status.catalog.entries)},
 		{"Cached outputs", formatInt(status.catalog.outputs)},
-		{"Oldest cache entry", formatOldestAccess(status.catalog, time.Now())},
+		{"Oldest cached blob", formatOldestAccess(status.catalog, time.Now())},
 		{"Live runs", formatLiveRuns(status.activeLiveRuns, status.inactiveLiveRuns)},
 		{"Last scan", formatStamp(status.lastScan)},
 		{"Last sweep", formatStamp(status.lastSweep)},
@@ -202,10 +202,6 @@ func readStatus(cfg config) (cacheStatus, error) {
 	return status, nil
 }
 
-// readCatalogStatus opens the catalog once and returns the aggregate status
-// plus the per-output rows. It performs a single GROUP BY output_id scan
-// (listOutputs) to derive the output count, sizes, and cached blob types, so
-// callers can reuse outputs for the blob-type breakdown without rescanning.
 // readCatalogStatus totals the catalog, and returns the per-output rows only when
 // withTypes is set. Those rows exist solely to feed classification, and listing
 // them on a large cache costs more than every aggregate here put together.
@@ -231,7 +227,7 @@ func readCatalogStatus(dbPath string, withTypes bool) (bool, catalogStatus, []ca
 		return false, catalogStatus{}, nil, fmt.Errorf("count catalog entries: %w", err)
 	}
 	var oldestAccessedAt sql.NullInt64
-	if err := db.QueryRowContext(ctx, `SELECT MIN(accessed_at) FROM entries`).Scan(&oldestAccessedAt); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT MIN(accessed_at) FROM outputs`).Scan(&oldestAccessedAt); err != nil {
 		return false, catalogStatus{}, nil, fmt.Errorf("find oldest catalog access: %w", err)
 	}
 	if oldestAccessedAt.Valid {

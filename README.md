@@ -93,7 +93,8 @@ entries, so its cost does not depend on how much is stored.
 "Cached actions" is an upper bound. Evicting a blob does not hunt down the
 actions that named it — nothing indexes that direction — so an action can outlive
 its output and be reported until the next age pass, or until a build asks for it
-and gets a miss. "Cached outputs" is what is actually on disk.
+and gets a miss. "Cached outputs" is what is actually on disk, and "Oldest cached
+blob" is the age of the oldest thing still occupying it.
 
 Add `-types` for a breakdown of what the cache holds by kind:
 

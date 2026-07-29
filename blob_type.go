@@ -17,13 +17,13 @@ const blobTypePrefixLimit = 64 << 10
 
 // blobClassifierVersion identifies the behavior of classifyBlobData. Cached
 // classifications are stored with the version that produced them (see
-// entries.blob_type_version); bump this whenever the classification logic
+// outputs.blob_type_version); bump this whenever the classification logic
 // changes so status ignores and recomputes stale cached values.
 const blobClassifierVersion = 1
 
 type blobTypeKind int
 
-// blobTypeKind values are persisted in the catalog's entries.blob_type column as
+// blobTypeKind values are persisted in the catalog's outputs.blob_type column as
 // a classification cache, so existing constants must not be renumbered; append
 // new kinds at the end. Prefer bumping blobClassifierVersion when detection
 // changes so old cached values are recomputed.

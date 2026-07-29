@@ -52,7 +52,7 @@ const (
 	pruneOvershootDivisor = 16
 
 	// evictionSampleSize sets how far one eviction step reaches into
-	// entries_accessed_at. Steps repeat until the overshoot is covered, trading a
+	// outputs_accessed_at. Steps repeat until the overshoot is covered, trading a
 	// few bounded queries for never ordering the whole catalog at once.
 	//
 	// It is a target rather than a hard cap: a step takes every entry sharing its
@@ -752,10 +752,8 @@ func (p prunePlan) empty() bool {
 
 func (st *store) planPrune(now time.Time) (prunePlan, error) {
 	plan := prunePlan{retainedCutoff: trimCutoff(st.retainedAge(), now)}
+	plan.entryCutoff = st.planOldEntries(now)
 	var err error
-	if plan.entryCutoff, err = st.planOldEntries(now); err != nil {
-		return prunePlan{}, err
-	}
 	if plan.retained, err = st.planOldRetainedFiles(now); err != nil {
 		return prunePlan{}, err
 	}
@@ -945,22 +943,18 @@ func (st *store) compressedSize() (int64, error) {
 	return total, nil
 }
 
-// planOldEntries returns the cutoff to delete by, or 0 when no entry is old
-// enough to be worth taking the lock for. MIN(accessed_at) is index-backed, so
-// answering that costs one seek rather than the DELETE's scan.
-func (st *store) planOldEntries(now time.Time) (int64, error) {
+// planOldEntries returns the cutoff to delete by, or 0 when age pruning is off.
+//
+// It used to ask MIN(accessed_at) first and return 0 when nothing was old enough,
+// which was worth a seek when entries carried an access index. Without one that
+// question costs the same table scan as the delete it was trying to avoid, so the
+// delete just runs. Asking outputs instead would be cheap and wrong: an entry can
+// be months stale while the output it names is kept warm by another action.
+func (st *store) planOldEntries(now time.Time) int64 {
 	if st.maxAge <= 0 {
-		return 0, nil
+		return 0
 	}
-	cutoff := unixMillis(trimCutoff(st.maxAge, now))
-	oldest, ok, err := st.q.oldestAccess(context.Background())
-	if err != nil {
-		return 0, fmt.Errorf("find oldest entry access: %w", err)
-	}
-	if !ok || oldest >= cutoff {
-		return 0, nil
-	}
-	return cutoff, nil
+	return unixMillis(trimCutoff(st.maxAge, now))
 }
 
 func (st *store) pruneOldEntries(cutoff int64) error {

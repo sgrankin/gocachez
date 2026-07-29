@@ -2010,7 +2010,10 @@ func TestPruneDoesNotCreateRunLockWhileCheckingLiveRuns(t *testing.T) {
 	}
 }
 
-func TestPlanPruneSkipsEntryDeleteWhenNothingIsStale(t *testing.T) {
+// Age pruning no longer asks whether anything is stale before running: without an
+// access index on entries that question costs the same table scan as the delete.
+// So the pass always runs, and what needs asserting is that it keeps what is fresh.
+func TestPruneKeepsEverythingWhenNothingIsStale(t *testing.T) {
 	t.Parallel()
 
 	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge})
@@ -2019,26 +2022,32 @@ func TestPlanPruneSkipsEntryDeleteWhenNothingIsStale(t *testing.T) {
 	}
 	defer st.close()
 
+	actionID := bytes.Repeat([]byte{97}, 32)
+	outputID := bytes.Repeat([]byte{98}, 32)
 	body := []byte("fresh")
 	if _, err := st.put(request{
 		ID:       1,
 		Command:  cmdPut,
-		ActionID: bytes.Repeat([]byte{97}, 32),
-		OutputID: bytes.Repeat([]byte{98}, 32),
+		ActionID: actionID,
+		OutputID: outputID,
 		BodySize: int64(len(body)),
 	}, bufio.NewReader(encodedBody(body))); err != nil {
 		t.Fatal(err)
 	}
-
-	// Everything was just written, so the age delete has nothing to match and
-	// the plan should not ask for it. MIN(accessed_at) answers that with a seek
-	// instead of the DELETE's scan.
-	plan, err := st.planPrune(time.Now())
-	if err != nil {
+	if _, err := st.db.ExecContext(context.Background(),
+		`DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
 		t.Fatal(err)
 	}
-	if plan.entryCutoff != 0 {
-		t.Fatalf("entryCutoff = %d with no stale entries, want 0", plan.entryCutoff)
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.lookupEntry(hexOf(actionID)); err != nil {
+		t.Fatalf("a fresh entry was pruned: %v", err)
+	}
+	if _, err := os.Stat(st.blobPath(hexOf(outputID))); err != nil {
+		t.Fatalf("a fresh blob was pruned: %v", err)
 	}
 }
 
@@ -3112,16 +3121,17 @@ func TestEvictionStepStaysBounded(t *testing.T) {
 		// Distinct access times, so no step has to over-reach to avoid splitting
 		// a timestamp.
 		accessedAt := now - int64(outputs) + int64(i)
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO outputs(output_id, size, compressed_size, accessed_at) VALUES (?, 1, 1, ?)`,
+		var outputRef int64
+		if err := tx.QueryRowContext(ctx,
+			`INSERT INTO outputs(output_id, size, compressed_size, accessed_at) VALUES (?, 1, 1, ?)
+			 RETURNING id`,
 			output[:], accessedAt,
-		); err != nil {
+		).Scan(&outputRef); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO entries(action_id, output_id, size, created_at, accessed_at)
-			 VALUES (?, ?, 1, ?, ?)`,
-			action[:], output[:], now, accessedAt,
+			`INSERT INTO entries(action_id, output, created_at, accessed_at) VALUES (?, ?, ?, ?)`,
+			action[:], outputRef, now, accessedAt,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -4139,7 +4149,7 @@ func TestRunStatusEmptyCache(t *testing.T) {
 	assertContains(t, got, "State               missing")
 	assertContains(t, got, "Cached actions      0")
 	assertContains(t, got, "Cached outputs      0")
-	assertContains(t, got, "Oldest cache entry  n/a")
+	assertContains(t, got, "Oldest cached blob  n/a")
 	assertContains(t, got, "Live runs           0 active, 0 inactive")
 	assertContains(t, got, "Storage:\n")
 	assertContains(t, got, "Original output size    0B")
@@ -4201,7 +4211,7 @@ func TestRunStatusInactiveCache(t *testing.T) {
 	assertContains(t, got, "State               present")
 	assertContains(t, got, "Cached actions      1")
 	assertContains(t, got, "Cached outputs      1")
-	assertContains(t, got, "Oldest cache entry  <1m")
+	assertContains(t, got, "Oldest cached blob  <1m")
 	assertContains(t, got, "Live runs           0 active, 0 inactive")
 	assertContains(t, got, "Original output size")
 	assertContains(t, got, "Compressed cache blobs")
@@ -6072,5 +6082,132 @@ func TestPruneReclaimsAnOutputNoEntryNamesAnyMore(t *testing.T) {
 	}
 	if _, err := os.Stat(st.blobPath(hexOf(replacement))); err != nil {
 		t.Errorf("replacement blob was pruned: %v", err)
+	}
+}
+
+// entries reference an output by an interned id, so that id must never be handed
+// out twice. A plain INTEGER PRIMARY KEY assigns max(id)+1 over the surviving
+// rows, which means evicting the newest output frees its id for the next put — and
+// an entry still naming it would then resolve to a different blob and hand back
+// the wrong build artifact, silently. AUTOINCREMENT is what forbids that.
+func TestEvictedOutputIDIsNeverReused(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	ctx := context.Background()
+	action := bytes.Repeat([]byte{81}, 32)
+	evicted := bytes.Repeat([]byte{82}, 32)
+	body := []byte("first artifact")
+	if _, err := st.put(request{
+		ID: 1, Command: cmdPut, ActionID: action, OutputID: evicted,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+
+	var evictedRef int64
+	if err := st.db.QueryRowContext(ctx, `SELECT output FROM entries WHERE action_id = ?`,
+		idKey(hexOf(action))).Scan(&evictedRef); err != nil {
+		t.Fatal(err)
+	}
+
+	// Size pressure takes the output. The entry naming it is left behind, because
+	// nothing indexes output back to action.
+	if _, err := st.q.evictOutput(ctx, hexOf(evicted), unixMillis(time.Now().Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+
+	// A different action produces different content.
+	replacement := bytes.Repeat([]byte{83}, 32)
+	otherBody := []byte("unrelated artifact")
+	if _, err := st.put(request{
+		ID: 2, Command: cmdPut, ActionID: bytes.Repeat([]byte{84}, 32), OutputID: replacement,
+		BodySize: int64(len(otherBody)),
+	}, bufio.NewReader(encodedBody(otherBody))); err != nil {
+		t.Fatal(err)
+	}
+	var replacementRef int64
+	if err := st.db.QueryRowContext(ctx, `SELECT id FROM outputs WHERE output_id = ?`,
+		idKey(hexOf(replacement))).Scan(&replacementRef); err != nil {
+		t.Fatal(err)
+	}
+	if replacementRef == evictedRef {
+		t.Fatalf("output id %d was reused after eviction", replacementRef)
+	}
+
+	// And the stale entry still reads as a miss rather than as the new content.
+	res, err := st.get(request{ID: 3, Command: cmdGet, ActionID: action})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Miss {
+		t.Fatalf("stale entry resolved to %x, want a miss", res.OutputID)
+	}
+}
+
+// A shared output read by one action keeps its own access time fresh, so the other
+// action's entry can pass maxAge while nothing in the inventory is stale at all.
+// Those mappings are most of the catalog, and no blob is waiting on them, so an
+// age pass that decided what to do by looking at outputs would never collect them.
+func TestPruneReapsAStaleEntryWhoseOutputIsStillWarm(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir(), maxAge: defaultMaxAge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	shared := bytes.Repeat([]byte{91}, 32)
+	warmAction := bytes.Repeat([]byte{92}, 32)
+	coldAction := bytes.Repeat([]byte{93}, 32)
+	body := []byte("shared artifact")
+	for i, action := range [][]byte{warmAction, coldAction} {
+		if _, err := st.put(request{
+			ID: int64(i), Command: cmdPut, ActionID: action, OutputID: shared,
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Only the cold action's mapping is stale. Every outputs row stays fresh,
+	// because the warm action is still reading the blob.
+	stale := unixMillis(trimCutoff(defaultMaxAge, time.Now())) - int64(time.Minute/time.Millisecond)
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
+		stale, idKey(hexOf(coldAction))); err != nil {
+		t.Fatal(err)
+	}
+	var oldestOutput int64
+	if err := st.db.QueryRowContext(context.Background(),
+		`SELECT MIN(accessed_at) FROM outputs`).Scan(&oldestOutput); err != nil {
+		t.Fatal(err)
+	}
+	if oldestOutput < stale {
+		t.Fatal("an output is stale, so this would not exercise the entries-only case")
+	}
+	if _, err := st.db.ExecContext(context.Background(),
+		`DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	expireMaintenanceStamps(t, st.versionDir)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.lookupEntry(hexOf(coldAction)); !errorsIs(err, sql.ErrNoRows) {
+		t.Fatalf("stale mapping was not reaped: %v", err)
+	}
+	if _, err := st.lookupEntry(hexOf(warmAction)); err != nil {
+		t.Fatalf("the warm mapping was reaped: %v", err)
+	}
+	if _, err := os.Stat(st.blobPath(hexOf(shared))); err != nil {
+		t.Fatalf("the shared blob was removed while still in use: %v", err)
 	}
 }

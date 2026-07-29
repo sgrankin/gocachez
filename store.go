@@ -42,13 +42,26 @@ const cacheSchemaVersion = 2
 // the 29 actions a production cache maps onto each output, and answering "how big
 // is the cache" meant a GROUP BY over every entry in it.
 //
-// entries.size is denormalised from outputs so a cache hit stays one primary-key
-// seek with no join.
+// entries references an output by an interned integer rather than repeating its
+// digest, which is affordable only because there is no reverse index: interning
+// lost to a plain digest when eviction still had to fan out. A cache hit pays one
+// join for it, measured at 3.9 to 4.3us, and the table drops from 100 to 62 bytes
+// a row.
+//
+// The id is AUTOINCREMENT because it must never be reused. A plain INTEGER PRIMARY
+// KEY hands out max(id)+1 of the surviving rows, so evicting the newest output
+// frees its id for the next put — and an entry still naming that id would then
+// resolve to different content, which is a wrong build artifact rather than a miss.
+//
+// entries has no index on accessed_at. It cost 51 bytes an entry, a third of the
+// catalog, to find rows that hold no disk — blob liveness is an outputs row — and
+// it made the age reaper 2.8x slower, because every deleted row had to have its
+// index entry deleted too.
 //
 // IDs are stored as the raw digest rather than the 64-character hex that Go uses
 // for paths. Hex doubles every copy of every key, and a production catalog spent
-// 650MiB on the key index alone. WITHOUT ROWID removes that index entirely by
-// making each table its own primary-key b-tree.
+// 650MiB on the key index alone. WITHOUT ROWID makes entries its own primary-key
+// b-tree instead of carrying a second copy.
 //
 // STRICT is what keeps that decision honest. Without it a hex string bound to a
 // BLOB column is stored as TEXT and never compares equal to the key it was meant
@@ -56,7 +69,8 @@ const cacheSchemaVersion = 2
 // STRICT turns that into "cannot store TEXT value in BLOB column".
 const catalogSchema = `
 CREATE TABLE IF NOT EXISTS outputs (
-	output_id BLOB PRIMARY KEY,
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	output_id BLOB NOT NULL UNIQUE,
 	size INTEGER NOT NULL,
 	compressed_size INTEGER NOT NULL,
 	accessed_at INTEGER NOT NULL,
@@ -64,17 +78,15 @@ CREATE TABLE IF NOT EXISTS outputs (
 	blob_type_version INTEGER,
 	retained_type INTEGER,
 	retained_type_version INTEGER
-) STRICT, WITHOUT ROWID;
+) STRICT;
 CREATE INDEX IF NOT EXISTS outputs_accessed_at ON outputs(accessed_at, compressed_size);
 
 CREATE TABLE IF NOT EXISTS entries (
 	action_id BLOB PRIMARY KEY,
-	output_id BLOB NOT NULL,
-	size INTEGER NOT NULL,
+	output INTEGER NOT NULL,
 	created_at INTEGER NOT NULL,
 	accessed_at INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS entries_accessed_at ON entries(accessed_at);
 
 CREATE TABLE IF NOT EXISTS runs (
 	run_id TEXT PRIMARY KEY,
@@ -90,8 +102,7 @@ type entry struct {
 	Size     int64
 	// CompressedSize and AccessedAt are inputs to a put, recorded against the
 	// output rather than the action. A lookup does not read them back — a cache hit
-	// has no use for either, and fetching them would mean joining outputs — so they
-	// are zero on anything lookupEntry returns.
+	// has no use for either — so they are zero on anything lookupEntry returns.
 	CompressedSize int64
 	CreatedAt      time.Time
 	AccessedAt     time.Time

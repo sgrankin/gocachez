@@ -35,17 +35,19 @@ func idKey(hexID string) []byte {
 //
 // action_id is deliberately absent from the select list: the caller passed it in,
 // so reading it back is a column of copying per cache hit to learn nothing.
+//
+// The join resolves the interned output reference. An entry whose output has been
+// evicted matches nothing and reads as a miss, which is the soft reference working.
 const lookupEntrySQL = `
-SELECT output_id, size, created_at
-FROM entries
-WHERE action_id = ?`
+SELECT o.output_id, o.size, e.created_at
+FROM entries e JOIN outputs o ON o.id = e.output
+WHERE e.action_id = ?`
 
 const upsertEntrySQL = `
-INSERT INTO entries(action_id, output_id, size, created_at, accessed_at)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO entries(action_id, output, created_at, accessed_at)
+VALUES (?, ?, ?, ?)
 ON CONFLICT(action_id) DO UPDATE SET
-	output_id = excluded.output_id,
-	size = excluded.size,
+	output = excluded.output,
 	created_at = excluded.created_at,
 	accessed_at = excluded.accessed_at`
 
@@ -58,7 +60,8 @@ VALUES (?, ?, ?, ?)
 ON CONFLICT(output_id) DO UPDATE SET
 	size = excluded.size,
 	compressed_size = excluded.compressed_size,
-	accessed_at = excluded.accessed_at`
+	accessed_at = excluded.accessed_at
+RETURNING id`
 
 const touchEntrySQL = `
 UPDATE entries
@@ -192,13 +195,16 @@ func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
 	if err != nil {
 		return fmt.Errorf("begin put transaction: %w", err)
 	}
-	if err := txExec(ctx, tx, c.upsertOutputStmt, upsertOutputSQL,
-		output, ent.Size, ent.CompressedSize, accessedAt); err != nil {
+	// RETURNING gives the interned id whether the output was new or already known,
+	// so the entry can reference it without a second lookup.
+	outputRef, err := txQueryInt64(ctx, tx, c.upsertOutputStmt, upsertOutputSQL,
+		output, ent.Size, ent.CompressedSize, accessedAt)
+	if err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("record output: %w", err)
 	}
 	if err := txExec(ctx, tx, c.upsertStmt, upsertEntrySQL,
-		action, output, ent.Size, unixMillis(ent.CreatedAt), accessedAt); err != nil {
+		action, outputRef, unixMillis(ent.CreatedAt), accessedAt); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("record entry: %w", err)
 	}
@@ -211,6 +217,19 @@ func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
 // txExec runs one statement in tx, using the catalog's prepared version when it
 // has one. A catalog built for a one-shot read (see newCatalog callers that never
 // call prepare) has none, and parses the SQL instead.
+// txQueryInt64 is txExec for a statement with a RETURNING clause. It scans here
+// rather than handing back a *sql.Row, because the tx-bound statement has to
+// outlive the scan and be closed after it.
+func txQueryInt64(ctx context.Context, tx *sql.Tx, stmt *sql.Stmt, query string, args ...any) (int64, error) {
+	var value int64
+	if stmt == nil {
+		return value, tx.QueryRowContext(ctx, query, args...).Scan(&value)
+	}
+	bound := tx.StmtContext(ctx, stmt)
+	defer bound.Close() //nolint:errcheck
+	return value, bound.QueryRowContext(ctx, args...).Scan(&value)
+}
+
 func txExec(ctx context.Context, tx *sql.Tx, stmt *sql.Stmt, query string, args ...any) error {
 	if stmt == nil {
 		_, err := tx.ExecContext(ctx, query, args...)
@@ -341,22 +360,6 @@ func deleteAccessedBeforeIn(ctx context.Context, db catalogDB, table string, cut
 		return 0, err
 	}
 	return res.RowsAffected()
-}
-
-// oldestAccess returns the least recent access time in either table, or ok=false
-// when the catalog is empty. Both are index-backed seeks, so callers can decide
-// whether an age-based delete has anything to match before paying for its scan.
-func (c *catalog) oldestAccess(ctx context.Context) (int64, bool, error) {
-	var oldest sql.NullInt64
-	if err := c.db.QueryRowContext(ctx, `
-SELECT MIN(oldest) FROM (
-	SELECT MIN(accessed_at) AS oldest FROM entries
-	UNION ALL
-	SELECT MIN(accessed_at) FROM outputs
-)`).Scan(&oldest); err != nil {
-		return 0, false, err
-	}
-	return oldest.Int64, oldest.Valid, nil
 }
 
 func (c *catalog) compressedSize(ctx context.Context) (int64, error) {
