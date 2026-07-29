@@ -153,9 +153,9 @@ type store struct {
 	accessFlushed     time.Time
 	// installed counts compressed bytes this run put, so a build large enough
 	// to overshoot maxSize can force a maintenance scan on the way out instead
-	// of waiting for pruneInterval. It counts puts rather than growth — a put
-	// of an output already in the cache adds nothing — which only ever errs
-	// toward scanning sooner.
+	// of waiting for pruneInterval. It counts every put rather than growth, so a put
+	// of an output already in the cache is counted too even though it added nothing,
+	// which only ever errs toward scanning sooner.
 	installed atomic.Int64
 }
 
@@ -681,7 +681,12 @@ func liveOutputID(path string) string {
 	// This ID reaches the catalog, where a name that is not a hex digest is a broken
 	// invariant and panics rather than being ignored — so a name we did not write has
 	// to stop being treated as an output ID here, at the boundary.
-	if _, err := hex.DecodeString(outputID); err != nil {
+	//
+	// Re-encoding rather than only decoding, because decoding accepts uppercase. An
+	// uppercase name would be retained under a shard like retained/AB, and the orphan
+	// scan visits 00 to ff in lowercase only, so nothing would ever collect it.
+	decoded, err := hex.DecodeString(outputID)
+	if err != nil || hex.EncodeToString(decoded) != outputID {
 		return ""
 	}
 	return outputID

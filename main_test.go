@@ -7198,3 +7198,54 @@ func TestRetainedExpiryRetriesAfterABusyCacheRatherThanWaitingAnHour(t *testing.
 		t.Error("a pass that ran did not stamp, so it will repeat on every close")
 	}
 }
+
+// Excluding an in-flight put from collection by skipping every hyphenated name excused
+// each other malformed file along with it, permanently: nothing references them, and
+// nothing would ever take them either. Only the shape a put actually writes is spared.
+func TestOrphanCollectionTakesAMalformedFileThatIsNotAPendingPut(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	shardDir := filepath.Join(st.blobsDir, "3c")
+	if err := os.MkdirAll(shardDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	junk := filepath.Join(shardDir, "3c-not-an-output-id.zst")
+	pending := filepath.Join(shardDir, strings.Repeat("3c", 32)+"-pending-1234.zst")
+	for _, path := range []string{junk, pending} {
+		if err := os.WriteFile(path, []byte("x"), 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	orphans, err := orphanFilesInDir(shardDir, map[string]struct{}{}, ".zst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(orphans, junk) {
+		t.Errorf("a malformed file no put would write was left uncollectable: %v", orphans)
+	}
+	if slices.Contains(orphans, pending) {
+		t.Errorf("collected the temporary file of a put in progress: %v", orphans)
+	}
+}
+
+// An uppercase name would be retained under a shard like retained/AB, and the orphan
+// scan walks 00 to ff in lowercase only — so it would never be collected. hex decoding
+// alone accepts uppercase, which is why this is not just a decode.
+func TestLiveOutputIDRejectsAnUppercaseName(t *testing.T) {
+	t.Parallel()
+
+	lower := strings.Repeat("ab", 32)
+	if got := liveOutputID("/live/ab/" + lower + "-pkg.a"); got != lower {
+		t.Errorf("liveOutputID(lowercase) = %q, want %q", got, lower)
+	}
+	if got := liveOutputID("/live/AB/" + strings.Repeat("AB", 32) + "-pkg.a"); got != "" {
+		t.Errorf("liveOutputID(uppercase) = %q, want it refused", got)
+	}
+}

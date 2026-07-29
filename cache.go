@@ -39,9 +39,9 @@ const (
 	// same way, with a 24h interval; gocachez uses a shorter one because it
 	// also enforces a size budget.
 	//
-	// The interval is a lower bound on the gap between scans, not an upper
-	// bound: a scan also requires the cache to be momentarily idle (see
-	// applyPrune), so a machine that always has a build running defers it.
+	// The interval is a lower bound on the gap between scans, not an upper bound.
+	// Retained-file expiry additionally requires the cache to be momentarily idle, and
+	// carries its own stamp so that waiting for one does not spend an interval.
 	pruneInterval = time.Hour
 
 	// pruneOvershootDivisor caps how far a *single* run can push the cache past
@@ -559,13 +559,13 @@ func (st *store) dropAction(actionID, outputID string) error {
 // across the analysis is what stalled a starting build for the length of a
 // whole scan. Only the deletions take it.
 //
-// What the lock guarantees is narrower than it once was: eviction and retained-file
-// expiry do not run unless the cache is idle. put and get never take the lock, so
-// "no run is registered" is what makes it safe to take a blob an entry still
-// resolves to, and applyPrune re-confirms that under the lock. Because the analysis
-// ran unlocked, applyPrune also re-verifies what it is about to delete — see
-// prunePlan. Expiring catalog rows by age and collecting files nothing references
-// are not in this plan at all; see sweepUnlocked for why they need no idle cache.
+// What the lock guarantees is narrower than it once was: retained-file expiry is the
+// only pass left that will not run unless the cache is idle, because a go list path is
+// handed to tooling and only the absence of builds says nobody holds it. Eviction takes
+// each output's stripe instead — every way it can interleave with a build ends in a
+// cache miss, since the name of a blob is the digest of its contents. Because the
+// analysis ran unlocked, applyPrune re-verifies what it is about to delete; see
+// prunePlan.
 //
 // That invariant has one gap, and it predates the split: unregisterRun deletes
 // its row before writing retained files and stamping run.lock, so a closing
@@ -628,7 +628,7 @@ func pruneCache(cfg config, stdout io.Writer) error {
 		return fmt.Errorf("count active runs: %w", err)
 	}
 	if active > 0 {
-		if _, err := fmt.Fprintf(stdout, "gocachez: %d build(s) still using the cache; size eviction is deferred\n", active); err != nil {
+		if _, err := fmt.Fprintf(stdout, "gocachez: %d build(s) still using the cache; retained-file expiry is deferred\n", active); err != nil {
 			return fmt.Errorf("report active runs: %w", err)
 		}
 	}
@@ -1024,8 +1024,8 @@ func (st *store) evictToMaxSize(candidates []pruneCandidate) ([]string, error) {
 // Age expiry used to sit inside the gated scan with everything else, which on a
 // host that always has a build running meant it never happened — and the catalog,
 // not the blobs, is what had grown to 3.1GiB there. It does not belong behind that
-// gate. Deleting a row touches no disk; only unlinking a blob does, and that stays
-// gated. The worst a concurrent build sees is a miss on something it had not read
+// gate — and nor, it turned out, did eviction, which followed it out. The worst a
+// concurrent build sees is a miss on something it had not read
 // in maxAge plus the hour of slack trimCutoff adds, which is a rebuild, not a wrong
 // answer — and the 30s access flush is well inside that hour, so an entry actually
 // in use is never a candidate.
@@ -1467,15 +1467,21 @@ func orphanFilesInDir(root string, referenced map[string]struct{}, extensions ..
 		if !slices.Contains(extensions, ext) {
 			return nil
 		}
-		outputID := strings.TrimSuffix(filepath.Base(path), ext)
-		// A put compresses into <output>-pending-<random>.zst in the same shard, so
-		// an in-flight put looks exactly like an unreferenced blob: its name is not
-		// an output ID, so nothing references it. That was harmless while collection
-		// only ran with no build registered. It is not now — unlinking one makes the
-		// rename that installs it fail, and the put fails with it — and the mtime
-		// grace does not cover a put stalled longer than that. Leftovers from a
-		// killed put are collected by removeStalePendingBlobs instead.
-		if strings.Contains(outputID, "-") {
+		base := filepath.Base(path)
+		outputID := strings.TrimSuffix(base, ext)
+		// A put compresses into <output>-pending-<random>.zst in the same shard, so an
+		// in-flight put looks exactly like an unreferenced blob: its name is not an
+		// output ID, so nothing references it. That was harmless while collection only
+		// ran with no build registered. It is not now — unlinking one makes the rename
+		// that installs it fail, and the put fails with it — and the mtime grace does
+		// not cover a put stalled longer than that. Leftovers from a killed put are
+		// collected by removeStalePendingBlobs instead.
+		//
+		// Matched against that exact shape rather than any name containing a hyphen,
+		// which excused every other malformed file from collection permanently.
+		if pending, err := filepath.Match(pendingBlobPattern, base); err != nil {
+			return err
+		} else if pending {
 			return nil
 		}
 		if _, ok := referenced[outputID]; !ok {
