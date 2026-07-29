@@ -133,6 +133,7 @@ type store struct {
 	q                 *catalog
 	versionDir        string
 	blobsDir          string
+	stripesDir        string
 	liveRoot          string
 	lifecycleLockPath string
 	runID             string
@@ -161,6 +162,11 @@ func newStore(cfg config) (*store, error) {
 	if err := os.MkdirAll(versionDir, 0o777); err != nil {
 		return nil, fmt.Errorf("create version dir: %w", err)
 	}
+	// Locks are taken here by builds and by maintenance alike, so the directory has
+	// to exist before either starts rather than being created under one of them.
+	if err := os.MkdirAll(stripesDir(versionDir), 0o777); err != nil {
+		return nil, fmt.Errorf("create stripe dir: %w", err)
+	}
 
 	var st *store
 	err := withFileLock(lifecycleLockPath, func() error {
@@ -183,6 +189,12 @@ func cachePaths(cfg config) (string, string, string, string) {
 		filepath.Join(versionDir, "blobs"),
 		filepath.Join(versionDir, "live"),
 		filepath.Join(versionDir, "lifecycle.lock")
+}
+
+// stripesDir holds the per-shard locks that serialise installing, materialising and
+// unlinking a blob. See store.withOutputLock.
+func stripesDir(versionDir string) string {
+	return filepath.Join(versionDir, "stripes")
 }
 
 func cacheVersionDir(cfg config) string {
@@ -322,6 +334,7 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 		q:                 newCatalog(db),
 		versionDir:        versionDir,
 		blobsDir:          blobsDir,
+		stripesDir:        stripesDir(versionDir),
 		liveRoot:          liveRoot,
 		lifecycleLockPath: lifecycleLockPath,
 		runID:             runID,

@@ -176,22 +176,29 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 		return response{}, fmt.Errorf("put body size mismatch: got %d bytes, expected %d", written, req.BodySize)
 	}
 
-	compressedSize, err := st.installBlob(blobTmpPath, outputHex)
-	if err != nil {
+	var compressedSize int64
+	// The stripe covers the file operations and nothing else. Deliberately not the
+	// catalog write that follows: a lock held across a transaction that can wait out a
+	// five-second busy timeout would stall every build wanting this shard, and the
+	// window it would close costs a cache miss rather than correctness.
+	if err := st.withOutputLock(outputHex, func() error {
+		var err error
+		compressedSize, err = installBlobLocked(blobTmpPath, st.blobPath(outputHex))
+		return err
+	}); err != nil {
 		return response{}, err
 	}
 	st.installed.Add(compressedSize)
 
 	now := time.Now()
-	ent := entry{
+	if err := st.upsertEntry(entry{
 		ActionID:       actionHex,
 		OutputID:       outputHex,
 		Size:           written,
 		CompressedSize: compressedSize,
 		CreatedAt:      now,
 		AccessedAt:     now,
-	}
-	if err := st.upsertEntry(ent); err != nil {
+	}); err != nil {
 		return response{}, err
 	}
 	keepBody = true
@@ -359,8 +366,14 @@ func (st *store) materialize(ent entry) (string, error) {
 		}
 	}()
 
-	blob, err := os.Open(st.blobPath(ent.OutputID))
-	if err != nil {
+	// The stripe is held only across the open. Once the descriptor exists, unlinking
+	// the blob cannot affect this read, so decompression runs outside it.
+	var blob *os.File
+	if err := st.withOutputLock(ent.OutputID, func() error {
+		var err error
+		blob, err = os.Open(st.blobPath(ent.OutputID))
+		return err
+	}); err != nil {
 		return "", err
 	}
 	defer blob.Close() //nolint:errcheck
@@ -480,10 +493,17 @@ func (st *store) createLiveFile(outputHex string) (string, error) {
 	return path, nil
 }
 
-func (st *store) installBlob(tmpPath, outputHex string) (int64, error) {
-	dst := st.blobPath(outputHex)
+// installBlobLocked puts a put's compressed output in place. The caller holds the
+// output's stripe across this and the catalog write that follows it.
+func installBlobLocked(tmpPath, dst string) (int64, error) {
 	if regularFile(dst) {
-		return adoptBlob(dst)
+		size, err := adoptBlob(dst)
+		// Losing the file between the check and the stamp is possible without the
+		// stripe and cheap to tolerate with it: install this put's copy instead of
+		// failing the put over a file that is no longer there.
+		if !errors.Is(err, os.ErrNotExist) {
+			return size, err
+		}
 	}
 	if err := os.Rename(tmpPath, dst); err != nil {
 		if !regularFile(dst) {
@@ -727,18 +747,6 @@ func clearMaintenanceStamps(versionDir string) error {
 }
 
 func (st *store) scan() error {
-	// Analysing a cache that other builds are still using is wasted work, and
-	// applyPrune would decline to delete anyway. A run row left behind by a
-	// killed helper defers the scan to the next exit, which reclaims it in
-	// newStore; the authoritative check happens under the lifecycle lock.
-	active, err := st.q.countRuns(context.Background())
-	if err != nil {
-		return fmt.Errorf("count active runs: %w", err)
-	}
-	if active > 0 {
-		return nil
-	}
-
 	plan, err := st.planPrune(time.Now())
 	if err != nil {
 		return err
@@ -823,6 +831,44 @@ func (st *store) planPrune(now time.Time) (prunePlan, error) {
 // first. The stamp is only written when a scan actually completed, so a declined
 // attempt is retried by the next process to exit past the interval.
 func (st *store) applyPrune(plan prunePlan) error {
+	// Another process may have finished a scan while this one was planning. Checked
+	// before any lock is taken, so a pass with nothing to do touches nothing.
+	if !st.pruneDue(time.Now()) {
+		return nil
+	}
+	// Eviction takes the stripe of every output it touches — the same lock a build
+	// takes to install or open one — so it no longer waits for an idle cache.
+	evicted, err := st.evictToMaxSize(plan.blobs)
+	if err != nil {
+		return err
+	}
+	// Retained files are a different matter. A path printed by go list is handed to
+	// tooling that may hold it for as long as a job runs, and nothing about the file
+	// says whether anyone does; only the absence of builds does. So this half still
+	// waits, and a busy cache defers it exactly as it always has. Attempted even with
+	// nothing planned, because reclaiming dead runs rides on the same lock.
+	if err := st.expireRetainedWhenIdle(plan); err != nil {
+		return err
+	}
+	// An evicted output has no inventory row left, so its retained files are
+	// unreferenced too, and nothing else in this pass would have looked at them.
+	// removeOrphans re-checks the shard, so anything referenced again is kept.
+	retained := make(map[int][]string)
+	st.addRetainedCandidates(retained, evicted)
+	if err := st.removeOrphans(retained, time.Now().Add(-orphanGrace)); err != nil {
+		return err
+	}
+	if err := st.markPruned(); err != nil {
+		return err
+	}
+	st.checkpointWAL()
+	return nil
+}
+
+// expireRetainedWhenIdle removes retained files past their age, but only with no build
+// registered. Reclaiming the directories of runs that are gone rides along, because it
+// needs the same lock: a starting store takes it too.
+func (st *store) expireRetainedWhenIdle(plan prunePlan) error {
 	applied, err := withFileLockIfFree(st.lifecycleLockPath, func() error {
 		if err := st.cleanupAbandonedRuns(); err != nil {
 			log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
@@ -834,42 +880,12 @@ func (st *store) applyPrune(plan prunePlan) error {
 		if active > 0 {
 			return nil
 		}
-		// Another process may have finished a scan while this one was planning.
-		if !st.pruneDue(time.Now()) {
-			return nil
-		}
-		if err := st.deletePlanned(plan); err != nil {
-			return err
-		}
-		if err := st.markPruned(); err != nil {
-			return err
-		}
-		st.checkpointWAL()
-		return nil
+		return st.removeExpiredRetainedFiles(plan.retained, plan.retainedCutoff)
 	})
 	if err == nil && !applied && st.verbose {
-		log.Print("gocachez: skipped maintenance, another process holds the cache lock")
+		log.Print("gocachez: skipped retained-file expiry, another process holds the cache lock")
 	}
 	return err
-}
-
-func (st *store) deletePlanned(plan prunePlan) error {
-	if plan.empty() {
-		return nil
-	}
-	if err := st.removeExpiredRetainedFiles(plan.retained, plan.retainedCutoff); err != nil {
-		return err
-	}
-	evicted, err := st.evictToMaxSize(plan.blobs)
-	if err != nil {
-		return err
-	}
-	// An evicted output has no inventory row left, so its retained files are
-	// unreferenced too, and nothing else in this pass would have looked at them.
-	// removeOrphans re-checks the shard, so anything referenced again is kept.
-	retained := make(map[int][]string)
-	st.addRetainedCandidates(retained, evicted)
-	return st.removeOrphans(retained, time.Now().Add(-orphanGrace))
 }
 
 // planToMaxSize lists blobs to evict, least recently used first, or nothing if
@@ -954,8 +970,16 @@ func (st *store) evictToMaxSize(candidates []pruneCandidate) ([]string, error) {
 		if !removed {
 			continue
 		}
-		if err := os.Remove(st.blobPath(candidate.outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("remove compressed entry: %w", err)
+		// The row is gone first, so a get from here on misses rather than resolving to
+		// a blob about to disappear. The stripe covers the unlink so a build part way
+		// through installing or opening this file finishes first.
+		if err := st.withOutputLock(candidate.outputID, func() error {
+			if err := os.Remove(st.blobPath(candidate.outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove compressed entry: %w", err)
+			}
+			return nil
+		}); err != nil {
+			return nil, err
 		}
 		total -= candidate.size
 		evicted = append(evicted, candidate.outputID)
@@ -1037,6 +1061,28 @@ func (st *store) removeStalePendingBlobs(now time.Time) error {
 		}
 	}
 	return errs
+}
+
+// withOutputLock runs fn holding the lock that guards one output's files: installing a
+// blob, opening it to materialise, and unlinking it.
+//
+// It guards file operations only, never a catalog write. One lock per blob shard rather
+// than per output, because the shard is already how the files are partitioned and a
+// fixed set means no lock file is created for an output that does not exist.
+//
+// What makes ungated eviction safe is not this lock. Every interleaving of installing,
+// reading and unlinking a content-addressed blob degrades to a cache miss: a get whose
+// blob has gone reports one and forgets the entry, a put whose file has gone installs
+// its own copy, and the bytes are identical either way because the name is the digest.
+// The lock narrows those windows so the misses are rarer; it is not what prevents them
+// from being worse. Removing it should cost hit rate and nothing else — which is also
+// why no test here fails without it.
+//
+// Exactly one is held at a time and nothing else is taken while one is, so there is no
+// ordering to get wrong. Maintenance takes the maintenance lock outside these; a build
+// takes only these.
+func (st *store) withOutputLock(outputHex string, fn func() error) error {
+	return withFileLock(filepath.Join(st.stripesDir, outputShard(outputHex)+".lock"), fn)
 }
 
 // orphanGrace is how recently a file may have been written and still be spared by
@@ -1305,20 +1351,32 @@ func (st *store) removeOrphans(orphans map[int][]string, modifiedBefore time.Tim
 		if err := st.referencedInShard(shard, keepEveryOutput, referenced); err != nil {
 			return err
 		}
-		for _, path := range orphans[shard] {
-			outputID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-			if _, ok := referenced[outputID]; ok {
-				continue
-			}
-			// Re-stat at the moment of deletion rather than trusting the walk: a put
-			// may have installed this file since, in which case its mtime is now and
-			// it is not ours to take.
-			if info, err := os.Stat(path); err == nil && !info.ModTime().Before(modifiedBefore) {
-				continue
-			}
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("remove orphan file in shard %s: %w", shardPrefix(shard), err)
-			}
+		// One stripe covers the whole shard, which is how the files are grouped here
+		// anyway, so this is one lock acquisition per shard rather than per file.
+		if err := st.withOutputLock(shardPrefix(shard), func() error {
+			return st.removeShardOrphans(orphans[shard], referenced, modifiedBefore)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (st *store) removeShardOrphans(paths []string, referenced map[string]struct{}, modifiedBefore time.Time) error {
+	for _, path := range paths {
+		outputID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		if _, ok := referenced[outputID]; ok {
+			continue
+		}
+		// Re-stat at the moment of deletion rather than trusting the walk: a put may
+		// have installed this file since, in which case its mtime is now and it is
+		// not ours to take. Under the stripe that is now a belt-and-braces check for
+		// the retained tree, which puts do not touch.
+		if info, err := os.Stat(path); err == nil && !info.ModTime().Before(modifiedBefore) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove orphan file %s: %w", filepath.Base(path), err)
 		}
 	}
 	return nil

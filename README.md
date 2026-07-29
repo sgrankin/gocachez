@@ -254,8 +254,17 @@ file no catalog row names cannot be reached by any build. A file written within 
 last minute is spared regardless, because that is what a put still recording itself
 looks like.
 
-Evicting to `maxSize` is different — it takes blobs that entries still resolve to,
-and a build may be reading one — so that runs at most once an hour and
+Evicting to `maxSize` also runs without waiting for an idle cache. Blobs are named by
+the digest of their contents, so every way a build and an eviction can interleave ends
+in a cache miss and a rebuild rather than a wrong answer: a build whose blob has gone
+reports a miss, and one whose file has gone installs its own copy of the same bytes.
+Eviction takes the oldest first, so something just written is the last thing reached —
+but a cache too small to hold the working set will still evict what is in use, because
+it cannot hold it.
+
+Expiring retained `go list` files is the one thing that does wait. Those paths are
+handed to tooling that may hold them for as long as a job runs, and nothing about the
+file says whether anyone does. That runs at most once an hour and
 only when no build is using the cache — the scan is proportional to the size
 of the cache, and the `go` command waits for `gocachez` to exit, so running it
 on every build would add that cost to every build. `maxSize` is therefore a

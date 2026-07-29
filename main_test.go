@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1394,46 +1395,59 @@ func assertCloseRetainsGeneratedGoSource(t *testing.T, body, actionID, outputID 
 	}
 }
 
-func TestPruneKeepsLiveBlobs(t *testing.T) {
+// Eviction is ungated, so what keeps an output a build is using is its position in the
+// order rather than a lock: it goes oldest first, and something just written is the
+// newest thing there is. A cache too small to hold the working set will still take it,
+// which is correct — that cache cannot hold the working set.
+func TestPruneEvictsTheColdestNotTheNewest(t *testing.T) {
 	t.Parallel()
 
-	st, err := newStore(config{
-		dir:     t.TempDir(),
-		maxSize: 1,
-	})
+	st, err := newStore(config{dir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.close()
 
-	actionID := bytes.Repeat([]byte{7}, 32)
-	outputID := bytes.Repeat([]byte{8}, 32)
-	if _, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: actionID,
-		OutputID: outputID,
-		BodySize: 64,
-	}, bufio.NewReader(encodedBody(bytes.Repeat([]byte("x"), 64)))); err != nil {
+	cold := bytes.Repeat([]byte{7}, 32)
+	fresh := bytes.Repeat([]byte{8}, 32)
+	for i, outputID := range [][]byte{cold, fresh} {
+		body := incompressibleBody(t, 8<<10, int64(i))
+		if _, err := st.put(request{
+			ID: int64(i), Command: cmdPut, ActionID: bytes.Repeat([]byte{byte(20 + i)}, 32),
+			OutputID: outputID, BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.db.ExecContext(context.Background(),
+		`UPDATE outputs SET accessed_at = ? WHERE output_id = ?`,
+		unixMillis(time.Now().Add(-90*24*time.Hour)), idKey(hexOf(cold))); err != nil {
 		t.Fatal(err)
 	}
+
+	total, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Room for one of the two.
+	st.maxSize = total * 2 / 3
+	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.lookupEntry(hexOf(actionID)); err != nil {
-		t.Fatalf("live entry was pruned: %v", err)
+
+	if _, err := os.Stat(st.blobPath(hexOf(cold))); !os.IsNotExist(err) {
+		t.Errorf("cold blob stat err = %v, want not exist", err)
 	}
-	if _, err := os.Stat(st.blobPath(hexOf(outputID))); err != nil {
-		t.Fatalf("live blob was pruned: %v", err)
+	if _, err := os.Stat(st.blobPath(hexOf(fresh))); err != nil {
+		t.Errorf("evicted the output that was just written: %v", err)
 	}
 }
 
-func TestPruneSkipsScanWhileLifecycleLockIsHeld(t *testing.T) {
+func TestPruneEvictsWithoutWaitingForTheLifecycleLock(t *testing.T) {
 	t.Parallel()
 
-	st, err := newStore(config{
-		dir: t.TempDir(),
-	})
+	st, err := newStore(config{dir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1449,22 +1463,11 @@ func TestPruneSkipsScanWhileLifecycleLockIsHeld(t *testing.T) {
 	}
 	defer lock.Close() //nolint:errcheck
 
-	// Contended: prune must neither scan nor wait. Waiting is what would put
-	// another process's whole scan on this process's exit path.
+	// Contended: eviction must neither wait for this lock nor need it. Waiting is what
+	// would put another process's whole scan on this process's exit path.
 	prunePromptly(t, st)
-	if _, err := os.Stat(blobPath); err != nil {
-		t.Fatalf("prune scanned without holding the lifecycle lock: %v", err)
-	}
-
-	// Uncontended: the stamp is still stale, so the next attempt does the work.
-	if err := lock.Unlock(); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.prune(); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
-		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+		t.Fatalf("over-budget blob stat err = %v, want not exist", err)
 	}
 }
 
@@ -2782,7 +2785,7 @@ func TestPruneRemovesRetainedFilesOfEvictedOutputs(t *testing.T) {
 	}
 }
 
-func TestPruneDeletesNothingWhileARunIsRegistered(t *testing.T) {
+func TestPruneEvictsWhileARunIsRegistered(t *testing.T) {
 	t.Parallel()
 
 	st, err := newStore(config{dir: t.TempDir()})
@@ -2791,21 +2794,11 @@ func TestPruneDeletesNothingWhileARunIsRegistered(t *testing.T) {
 	}
 	defer st.close()
 
-	// This store's own run is registered, so the cache is in use. Eviction takes
-	// blobs that entries still resolve to, and a build may be materialising one, so
-	// that is the half an idle cache is still required for.
-	actionID := bytes.Repeat([]byte{88}, 32)
-	outputID := bytes.Repeat([]byte{89}, 32)
-	body := incompressibleBody(t, 4096, 3)
-	if _, err := st.put(request{
-		ID: 1, Command: cmdPut, ActionID: actionID, OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body))); err != nil {
-		t.Fatal(err)
-	}
-	blobPath := st.blobPath(hexOf(outputID))
-	st.maxSize = 1
-
+	// This store's own run stays registered, so the cache is in use. Eviction takes
+	// each output under the same stripe a build takes to install or open it, so it no
+	// longer needs the cache to fall idle — which on a host that always has a build
+	// running it never did.
+	blobPath := overBudgetBlob(t, st, 0x59)
 	plan, err := st.planPrune(time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -2813,16 +2806,18 @@ func TestPruneDeletesNothingWhileARunIsRegistered(t *testing.T) {
 	if len(plan.blobs) == 0 {
 		t.Fatal("planPrune did not plan the over-budget blob")
 	}
+	expireMaintenanceStamps(t, st.versionDir)
 	if err := st.applyPrune(plan); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(blobPath); err != nil {
-		t.Fatalf("evicted while a run was registered: %v", err)
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatalf("over-budget blob stat err = %v, want not exist", err)
 	}
-	// And it must not stamp, or the scan it declined would be skipped for an
-	// hour after the cache went idle.
-	if _, err := os.Stat(pruneStampPath(st.versionDir)); !os.IsNotExist(err) {
-		t.Fatalf("prune stamped without scanning: stat err = %v, want not exist", err)
+	// And it stamps, because the ungated half did its work. Withholding the stamp
+	// until the cache went idle would put eviction on every build's exit path, which
+	// is what the interval exists to prevent.
+	if _, err := os.Stat(pruneStampPath(st.versionDir)); err != nil {
+		t.Fatalf("a pass that evicted did not stamp: %v", err)
 	}
 }
 
@@ -6809,5 +6804,69 @@ func TestReusedOutputIDIsCaughtRatherThanServed(t *testing.T) {
 	// And the output it wrongly resolved to is somebody else's, so it stays.
 	if _, err := os.Stat(st.blobPath(hexOf(otherOutput))); err != nil {
 		t.Errorf("took the innocent output's blob: %v", err)
+	}
+}
+
+// Eviction runs against live builds now, so installing a blob and unlinking one race
+// unless they take the same lock. Without it a put that found its output already on
+// disk fails when the file goes between the check and the stamp — and a failed put
+// reaches the go command as an error, not a cache miss.
+func TestPutAndEvictionDoNotRaceOverTheSameOutput(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	outputID := bytes.Repeat([]byte{66}, 32)
+	outputHex := hexOf(outputID)
+	body := incompressibleBody(t, 4<<10, 5)
+
+	const rounds = 60
+	var wg sync.WaitGroup
+	putErr := make(chan error, rounds)
+	evictErr := make(chan error, rounds)
+
+	wg.Go(func() {
+		for i := range rounds {
+			if _, err := st.put(request{
+				ID: int64(i), Command: cmdPut,
+				ActionID: bytes.Repeat([]byte{byte(i)}, 32),
+				OutputID: outputID, BodySize: int64(len(body)),
+			}, bufio.NewReader(encodedBody(body))); err != nil {
+				putErr <- err
+				return
+			}
+		}
+	})
+
+	wg.Go(func() {
+		// A far-future access time makes the re-assert always pass, so every round
+		// genuinely tries to take the blob rather than declining.
+		candidate := []pruneCandidate{{
+			outputID:   outputHex,
+			size:       1,
+			accessedAt: unixMillis(time.Now().Add(24 * time.Hour)),
+		}}
+		for range rounds {
+			if _, err := st.evictToMaxSize(candidate); err != nil {
+				evictErr <- err
+				return
+			}
+		}
+	})
+	wg.Wait()
+
+	select {
+	case err := <-putErr:
+		t.Fatalf("a put failed against concurrent eviction: %v", err)
+	default:
+	}
+	select {
+	case err := <-evictErr:
+		t.Fatalf("eviction failed against concurrent puts: %v", err)
+	default:
 	}
 }
