@@ -89,6 +89,85 @@ func TestStorePutGet(t *testing.T) {
 	}
 }
 
+type unlockWriterOnRetryDB struct {
+	*sql.DB
+	writer *sql.Tx
+	begins int
+}
+
+func (db *unlockWriterOnRetryDB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	db.begins++
+	if db.begins == 2 {
+		if err := db.writer.Rollback(); err != nil {
+			return nil, fmt.Errorf("release competing writer: %w", err)
+		}
+	}
+	return db.DB.BeginTx(ctx, opts)
+}
+
+// A maintenance batch or another helper can occupy SQLite's single writer slot
+// for the whole busy timeout. The put must restart its transaction after that
+// race: retrying either statement inside the failed transaction is not safe.
+func TestPutRetriesBusyCatalogTransaction(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "cache.db")
+	holder, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close() //nolint:errcheck
+
+	ctx := context.Background()
+	writer, err := holder.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Rollback() //nolint:errcheck
+	if _, err := writer.ExecContext(ctx,
+		`INSERT INTO runs(run_id, path, created_at) VALUES ('writer', 'live/writer', 1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep the regression fast while still producing the driver's real
+	// SQLITE_BUSY error. Production connections wait five seconds per attempt.
+	contender, err := sql.Open("sqlite",
+		"file:"+filepath.ToSlash(path)+"?_pragma=busy_timeout(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer contender.Close() //nolint:errcheck
+	contender.SetMaxOpenConns(1)
+	contender.SetMaxIdleConns(1)
+
+	retryingDB := &unlockWriterOnRetryDB{DB: contender, writer: writer}
+	c := newCatalog(retryingDB)
+	actionID := bytes.Repeat([]byte{101}, 32)
+	outputID := bytes.Repeat([]byte{102}, 32)
+	now := time.Now()
+	if err := c.upsertEntry(ctx, entry{
+		ActionID:       hexOf(actionID),
+		OutputID:       hexOf(outputID),
+		Size:           10,
+		CompressedSize: 5,
+		CreatedAt:      now,
+		AccessedAt:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if retryingDB.begins != 2 {
+		t.Fatalf("began %d transactions, want the busy transaction and one retry", retryingDB.begins)
+	}
+
+	got, err := c.lookupEntry(ctx, hexOf(actionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OutputID != hexOf(outputID) {
+		t.Errorf("stored output = %s, want %s", got.OutputID, hexOf(outputID))
+	}
+}
+
 func TestGetMiss(t *testing.T) {
 	t.Parallel()
 

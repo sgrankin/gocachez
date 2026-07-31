@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 )
 
 type catalogDB interface {
@@ -211,6 +212,47 @@ WHERE run_id = ?`, runID)
 // know about — the direction that would make the cache claim bytes it is not
 // accounting for.
 func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
+	return retrySQLiteBusy(ctx, func() error {
+		return c.upsertEntryOnce(ctx, ent)
+	})
+}
+
+// A busy timeout covers one attempt to acquire SQLite's single writer slot, but
+// does not guarantee a waiting put a turn between maintenance batches or other
+// helpers' puts. Restart the whole transaction: both statements are upserts, so
+// repeating either after a disputed commit is safe. Three attempts bound the
+// normal five-second timeout to roughly fifteen seconds instead of failing a
+// build after the first unlucky writer race.
+const (
+	catalogPutAttempts    = 3
+	catalogPutBackoff     = 10 * time.Millisecond
+	sqliteBusyPrimaryCode = 5
+)
+
+func retrySQLiteBusy(ctx context.Context, fn func() error) error {
+	for attempt := 1; ; attempt++ {
+		err := fn()
+		if !isSQLiteBusy(err) || attempt == catalogPutAttempts {
+			return err
+		}
+
+		timer := time.NewTimer(time.Duration(attempt) * catalogPutBackoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func isSQLiteBusy(err error) bool {
+	var sqliteErr interface{ Code() int }
+	// SQLite keeps the primary result in the low byte of an extended code.
+	return errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqliteBusyPrimaryCode
+}
+
+func (c *catalog) upsertEntryOnce(ctx context.Context, ent entry) error {
 	action, output := idKey(ent.ActionID), idKey(ent.OutputID)
 	accessedAt := unixMillis(ent.AccessedAt)
 	tx, err := c.db.BeginTx(ctx, nil)
