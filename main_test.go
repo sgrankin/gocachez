@@ -940,6 +940,51 @@ func TestRejectsMismatchedDBVersion(t *testing.T) {
 	}
 }
 
+func TestOpenInitializedCatalogTakesNoWriteLock(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the writer lock the way a concurrent put does. WAL keeps readers
+	// running, so opening an initialized catalog must not need more than a read:
+	// it has nothing left to write.
+	holder, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	conn, err := holder.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = conn.ExecContext(ctx, `ROLLBACK`) }()
+
+	start := time.Now()
+	reopened, err := openDB(dbPath)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("openDB on an initialized catalog contended for the writer lock: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("openDB waited %v on the writer lock, want no write at all", elapsed)
+	}
+}
+
 func TestReclaimsAbandonedUnlockedRun(t *testing.T) {
 	t.Parallel()
 

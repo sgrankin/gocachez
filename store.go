@@ -502,6 +502,13 @@ func initDB(db *sql.DB) error {
 	if version != 0 && version != cacheSchemaVersion {
 		return fmt.Errorf("unsupported catalog version %d, want %d", version, cacheSchemaVersion)
 	}
+	// An initialized catalog needs no write to open. Re-running the DDL and
+	// re-stamping the version take the single writer lock, so every concurrent
+	// opener contended for it against the busy timeout, and one losing that race
+	// failed a whole build before it had read anything.
+	if version == cacheSchemaVersion {
+		return nil
+	}
 	if _, err := db.ExecContext(ctx, catalogSchema); err != nil {
 		return fmt.Errorf("initialize catalog: %w", err)
 	}
